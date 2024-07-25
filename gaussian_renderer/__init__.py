@@ -1067,7 +1067,8 @@ def gsplat_distributed_preprocess3dgs_and_all2all_final(
         timers.start("forward_prepare_gaussians")
     
     param_handles = []
-    send2gpu_filter = None    
+    send2gpu_filter = None  
+    send2gpu_filter_cpu = None  
     if offload:
         # TODO: Optimizate this: use send2gpu_filter from prev iter to load only updated means3D
         # NOTE: After densification, (means3D_all, prev_filter, prev_filter_cpu) are reset to None.
