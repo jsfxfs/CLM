@@ -22,6 +22,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 import utils.general_utils as utils
 import torch.distributed as dist
+import cpu_adam
 
 lr_scale_fns = {
     "linear": lambda x: x,
@@ -291,7 +292,23 @@ class GaussianModel:
             },
         ]
 
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        if utils.get_args().adam_type == "cpu_adam":
+            self.optimizer = cpu_adam.CPUAdam(
+                l,
+                lr=0.0,
+                bias_correction=True,# this is required
+                betas=(0.9, 0.999),# use adam default betas
+                eps=1e-15,# use the value below to match with when using torch adam
+                weight_decay=0,# use adam default weight decay
+                amsgrad=False,
+                adamw_mode=False,
+                fp32_optimizer_states=True,
+            )
+        elif utils.get_args().adam_type == "default_adam":
+            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        else:
+            raise ValueError("adam_type should be either 'cpu_adam' or 'default'.")
+
         # self.optimizer = torch.optim.SGD(l, lr=0.0, momentum=0.1)
 
         bsz = utils.get_args().bsz

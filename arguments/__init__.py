@@ -172,6 +172,8 @@ class DistributionParams(ParamGroup):
         self.num_train_cameras = -1
         self.num_test_cameras = -1
 
+        self.adam_type = "default_adam"  # "default_adam", "cpu_adam"
+
         super().__init__(parser, "Distribution Parameters")
 
 
