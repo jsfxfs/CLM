@@ -142,7 +142,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         # utils.memory_report("at the beginning of an iteration")
         timers.clear()
         if args.nsys_profile:
-            nvtx.range_push(f"iteration[{iteration},{iteration+args.bsz})")
+            assert args.bsz == 1, "nsys profiling only supports batch size 1"
+            if iteration == args.nsys_profile_start_iter:
+                torch.cuda.cudart().cudaProfilerStart()
+            if iteration == args.nsys_profile_end_iter or iteration == opt_args.iterations:
+                torch.cuda.cudart().cudaProfilerStop()
+            if iteration >= args.nsys_profile_start_iter and iteration < args.nsys_profile_end_iter:
+                nvtx.range_push(f"iteration[{iteration},{iteration+args.bsz})")
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if utils.check_update_at_this_iter(iteration, args.bsz, 1000, 0):
             gaussians.oneupSHdegree()
@@ -577,7 +583,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         ) in batched_cameras:  # Release memory of locally rendered original_image
             viewpoint_cam.original_image = None
         if args.nsys_profile:
-            nvtx.range_pop()
+            if iteration >= args.nsys_profile_start_iter and iteration < args.nsys_profile_end_iter:
+                nvtx.range_pop()
         if utils.check_enable_python_timer():
             timers.printTimers(iteration, mode="sum")
         if args.trace_cuda_mem:
@@ -599,6 +606,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         )
     )
     progress_bar.close()
+
+    if args.nsys_profile:
+        torch.cuda.cudart().cudaProfilerStop()
 
 
 def training_report(

@@ -205,6 +205,8 @@ class DebugParams(ParamGroup):
         self.time_image_loading = False  # Log image loading time.
 
         self.nsys_profile = False  # profile with nsys.
+        self.nsys_profile_start_iter = 1  # profile with nsys start iteration.
+        self.nsys_profile_end_iter = 1000000 # profile with nsys end iteration.
         self.drop_initial_3dgs_p = 0.0  # profile with nsys.
         self.drop_duplicate_gaussians_coeff = 1.0
 
