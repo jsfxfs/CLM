@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import utils.general_utils as utils
 import torch.distributed as dist
-from utils.loss_utils import pixelwise_l1_with_mask, pixelwise_ssim_with_mask
+from utils.loss_utils import pixelwise_l1_with_mask, pixelwise_ssim_with_mask, l1_loss, ssim
 import time
 import diff_gaussian_rasterization
 import math
+from fused_ssim import fused_ssim
 
 class FinalLoss(nn.Module):
     def __init__(self):
@@ -2590,6 +2591,9 @@ def final_system_loss_computation(
     elif args.offload and args.fused_loss == 'torch_compile':
         global COMPILED_LOSS_MODULE
         Ll1, ssim_loss = COMPILED_LOSS_MODULE(local_image_rect, local_image_rect_gt, local_image_rect_pixels_compute_locally)
+    elif args.offload and args.fused_loss == 'advanced_fuse':
+        Ll1 = l1_loss(local_image_rect, local_image_rect_gt)
+        ssim_loss = fused_ssim(local_image_rect.unsqueeze(0), local_image_rect_gt.unsqueeze(0))
     else:
         pixelwise_Ll1 = pixelwise_l1_with_mask(
             local_image_rect, local_image_rect_gt, local_image_rect_pixels_compute_locally
