@@ -17,7 +17,7 @@ from torch.utils.data import Dataset
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON, loadCam
+from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON, loadCam, predecode_dataset_to_disk, clean_up_disk, loadCam_gt_from_disk
 import utils.general_utils as utils
 
 
@@ -109,6 +109,10 @@ class Scene:
             / 1e9
         )
         log_file.write(f"Dataset size: {dataset_size_in_GB} GB\n")
+        
+        # Preprocess dataset
+        # Train on original resolution, no downsampling in our implementation.
+        assert not (args.decode_dataset_to_disk and args.preload_dataset_to_gpu_threshold > 0), "Can not preload dataset to gpu and offload it to disk at the same time. Disable `decode_dataset_to_disk` or reset `preload_dataset_to_gpu_threshold`."
         if (
             dataset_size_in_GB < args.preload_dataset_to_gpu_threshold
         ):  # 10GB memory limit for dataset
@@ -122,48 +126,86 @@ class Scene:
             args.local_sampling = False  # TODO: Preloading dataset to GPU is not compatible with local_sampling and distributed_dataset_storage for now. Fix this.
             args.distributed_dataset_storage = False
 
-        # Train on original resolution, no downsampling in our implementation.
-        # TODO: For simplicity, for now we use preloaded dataset for evaluation. Should use customized dataloader once fixed.
-        # If not using torch DataLoader, decode dataset and store it in memory.
-        # if not args.torch_dataloader:
-        utils.print_rank_0("Decoding Training Cameras")
-        self.train_cameras = None
-        self.test_cameras = None
-        if args.num_train_cameras >= 0:
-            train_cameras = scene_info.train_cameras[: args.num_train_cameras]
-        else:
-            train_cameras = scene_info.train_cameras
-        self.train_cameras = cameraList_from_camInfos(train_cameras, args)
-        # output the number of cameras in the training set and image size to the log file
-        log_file.write(
-            "Number of local training cameras: {}\n".format(len(self.train_cameras))
-        )
-        if len(self.train_cameras) > 0:
-            log_file.write(
-                "Image size: {}x{}\n".format(
-                    self.train_cameras[0].image_height,
-                    self.train_cameras[0].image_width,
-                )
-            )
-
-        if args.eval:
-            utils.print_rank_0("Decoding Test Cameras")
-            if args.num_test_cameras >= 0:
-                test_cameras = scene_info.test_cameras[: args.num_test_cameras]
+        if args.decode_dataset_to_disk:
+            # Predecode dataset as raw files to local disk
+            self.decode_dataset_path = os.path.join(args.decode_dataset_path, "dataset_raw")
+            statvfs = os.statvfs(self.decode_dataset_path)
+            available_space_in_GB = 1.0 * statvfs.f_frsize * statvfs.f_bavail / 1e9
+            assert available_space_in_GB >= dataset_size_in_GB, "Not enough space in disk for decompressed dataset."
+            
+            log_file.write(f"[NOTE]: Pre-decoding dataset({dataset_size_in_GB}GB) to disk dir: {self.decode_dataset_path}\n")
+            utils.print_rank_0("Decoding Training Cameras To Disk")
+            self.train_cameras = None
+            self.test_cameras = None
+            if args.num_train_cameras >= 0:
+                train_cameras = scene_info.train_cameras[: args.num_train_cameras]
             else:
-                test_cameras = scene_info.test_cameras
-            self.test_cameras = cameraList_from_camInfos(test_cameras, args)
-            # output the number of cameras in the training set and image size to the log file
-            log_file.write(
-                "Number of local test cameras: {}\n".format(len(self.test_cameras))
-            )
-            if len(self.test_cameras) > 0:
+                train_cameras = scene_info.train_cameras
+            predecode_dataset_to_disk(train_cameras, args)
+            
+            if len(train_cameras) > 0:
                 log_file.write(
-                    "Image size: {}x{}\n".format(
-                        self.test_cameras[0].image_height,
-                        self.test_cameras[0].image_width,
+                    "TrainImage size: {}x{}\n".format(
+                        train_cameras[0].height,
+                        train_cameras[0].width,
                     )
                 )
+            
+            if args.eval:
+                utils.print_rank_0("Decoding Test Cameras To Disk")
+                if args.num_test_cameras >= 0:
+                    test_cameras = scene_info.test_cameras[: args.num_test_cameras]
+                else:
+                    test_cameras = scene_info.test_cameras
+                predecode_dataset_to_disk(test_cameras, args)
+                if len(test_cameras) > 0:
+                    log_file.write(
+                        "Test Image size: {}x{}\n".format(
+                            test_cameras[0].height,
+                            test_cameras[0].width,
+                        )
+                    )
+        
+        else:
+            # Decode dataset in memory
+            utils.print_rank_0("Decoding Training Cameras")
+            self.train_cameras = None
+            self.test_cameras = None
+            if args.num_train_cameras >= 0:
+                train_cameras = scene_info.train_cameras[: args.num_train_cameras]
+            else:
+                train_cameras = scene_info.train_cameras
+            self.train_cameras = cameraList_from_camInfos(train_cameras, args)
+            # output the number of cameras in the training set and image size to the log file
+            log_file.write(
+                "Number of local training cameras: {}\n".format(len(self.train_cameras))
+            )
+            if len(self.train_cameras) > 0:
+                log_file.write(
+                    "Image size: {}x{}\n".format(
+                        self.train_cameras[0].image_height,
+                        self.train_cameras[0].image_width,
+                    )
+                )
+
+            if args.eval:
+                utils.print_rank_0("Decoding Test Cameras")
+                if args.num_test_cameras >= 0:
+                    test_cameras = scene_info.test_cameras[: args.num_test_cameras]
+                else:
+                    test_cameras = scene_info.test_cameras
+                self.test_cameras = cameraList_from_camInfos(test_cameras, args)
+                # output the number of cameras in the training set and image size to the log file
+                log_file.write(
+                    "Number of local test cameras: {}\n".format(len(self.test_cameras))
+                )
+                if len(self.test_cameras) > 0:
+                    log_file.write(
+                        "Image size: {}x{}\n".format(
+                            self.test_cameras[0].image_height,
+                            self.test_cameras[0].image_width,
+                        )
+                    )
 
         utils.check_initial_gpu_memory_usage("after Loading all images")
         utils.log_cpu_memory_usage("after decoding images")
@@ -218,6 +260,10 @@ class Scene:
         log_file.write("scaling shape: {}\n".format(self.gaussians._scaling.shape))
         log_file.write("rotation shape: {}\n".format(self.gaussians._rotation.shape))
 
+    def clean_up(self):
+        if self.args.decode_dataset_to_disk:
+            clean_up_disk(self.args)
+            utils.print_rank_0("Cleaned up decoded dataset on disk.")
 
 class SceneDataset:
     def __init__(self, cameras):
@@ -258,7 +304,7 @@ class SceneDataset:
                 self.cur_epoch_cameras = self.sample_camera_idx.copy()
             else:
                 self.cur_epoch_cameras = list(range(self.camera_size))
-            random.shuffle(self.cur_epoch_cameras)
+            # random.shuffle(self.cur_epoch_cameras)
 
         self.cur_iteration += 1
 
@@ -342,14 +388,20 @@ class TorchSceneDataset(Dataset):
         return self.camera_size
 
     def __getitem__(self, id):
-        #TODO: arg `id` in `loadCam()` is supposed to be the index inside a batch, not the global index in dataset. Passing `id` is meaningless.
-        return loadCam(
-            self.args,
-            id,
-            self.cameras[id],
-            decompressed_image=None,
-            return_image=False,
-        )
+        if (self.args.decode_dataset_to_disk):
+            return loadCam_gt_from_disk(
+                self.args,
+                id,
+                self.cameras[id],
+            )
+        else:
+            return loadCam(
+                self.args,
+                id, #TODO: arg `id` in `loadCam()` is supposed to be the index inside a batch, not the global index in dataset. Passing `id` is meaningless.
+                self.cameras[id],
+                decompressed_image=None,
+                return_image=False,
+            )
 
     @property 
     def cur_epoch(self):

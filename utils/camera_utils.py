@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
+import shutil
 from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch, get_args, get_log_file
@@ -83,6 +85,32 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
         torch_dataloader=args.torch_dataloader,
     )
 
+def loadCam_gt_from_disk(args, id, cam_info):
+    orig_w, orig_h = cam_info.width, cam_info.height
+    assert (
+        orig_w == utils.get_img_width() and orig_h == utils.get_img_height()
+    ), "All images should have the same size. "
+    
+    # Get dececoded gt_image from disk
+    with open(os.path.join(args.decode_dataset_path, 'dataset_raw', (cam_info.image_name + '.raw')), 'rb') as raw_file:
+        raw_data = raw_file.read()
+    raw_np = np.frombuffer(raw_data, dtype=np.uint8)
+    image_tensor_host = torch.tensor(raw_np, dtype=torch.uint8).view(orig_h, orig_w, -1).permute(2, 0, 1)
+    # image_tensor_host = torch.tensor(raw_np, dtype=torch.uint8).view(orig_h, orig_w, -1).permute(2, 0, 1).pin_memory()
+    # image_tensor_device = image_tensor_host.to('cuda').view(orig_h, orig_w, -1).permute(2, 0, 1)
+    
+    return Camera(
+        colmap_id=cam_info.uid,
+        R=cam_info.R,
+        T=cam_info.T,
+        FoVx=cam_info.FovX,
+        FoVy=cam_info.FovY,
+        image=image_tensor_host,
+        gt_alpha_mask=None,
+        image_name=cam_info.image_name,
+        uid=id,
+        torch_dataloader=args.torch_dataloader,
+    )
 
 def load_decompressed_image(params):
     args, id, cam_info = params
@@ -207,6 +235,16 @@ def decompressed_images_from_camInfos_multiprocess_sharedmem(
 
     return decompressed_images
 
+def predecode_dataset_to_disk(cam_infos, args):
+    args = get_args()
+    for id, c in tqdm(enumerate(cam_infos), total=len(cam_infos)):
+        img = Image.open(c.image_path)
+        raw_data = img.tobytes()
+        with open(os.path.join(args.decode_dataset_path, 'dataset_raw', (c.image_name + '.raw')), 'wb') as raw_file:
+            raw_file.write(raw_data)
+
+def clean_up_disk(args):
+    shutil.rmtree(os.path.join(args.decode_dataset_path, 'dataset_raw'))
 
 def cameraList_from_camInfos(cam_infos, args):
     args = get_args()

@@ -80,6 +80,8 @@ class AuxiliaryParams(ParamGroup):
         self.fused_loss = "torch_compile" # "default", "hand_written", "torch_compile", "advanced_fuse"s
         self.accumulate_grads = False
         self.torch_dataloader = False
+        self.decode_dataset_to_disk = False
+        self.decode_dataset_path = "/tmp"
         self.num_workers = 0
         super().__init__(parser, "Loading Parameters", sentinel)
 

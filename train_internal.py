@@ -49,7 +49,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
     with torch.no_grad():
         if args.torch_dataloader:
-            scene = Scene(args, gaussians, shuffle=False)
+            scene = Scene(args, gaussians, shuffle=True)
         else:
             scene = Scene(args, gaussians)
         gaussians.training_setup(opt_args)
@@ -72,24 +72,24 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         train_dataset = TorchSceneDataset(scene.getTrainCamerasInfo())
         if args.num_workers == 0:
             dataloader = DataLoader(
-            train_dataset,
-            batch_size=args.bsz,
-            shuffle=True,
-            drop_last=True,
-            pin_memory=True,
-            collate_fn=custom_collate_fn
-        )
+                train_dataset,
+                batch_size=args.bsz,
+                # shuffle=True,
+                drop_last=True,
+                pin_memory=True,
+                collate_fn=custom_collate_fn
+            )
         elif args.num_workers > 0:
             dataloader = DataLoader(
-            train_dataset,
-            batch_size=args.bsz,
-            num_workers=args.num_workers,
-            shuffle=True,
-            drop_last=True,
-            persistent_workers=True,
-            pin_memory=True,
-            collate_fn=custom_collate_fn
-        )
+                train_dataset,
+                batch_size=args.bsz,
+                num_workers=args.num_workers,
+                # shuffle=True,
+                drop_last=True,
+                persistent_workers=True,
+                pin_memory=True,
+                collate_fn=custom_collate_fn
+            )
         else:
             assert False, "`num_workers` should be a positive number"
         dataloader_iter = iter(dataloader)
@@ -976,7 +976,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         )
     )
     progress_bar.close()
-
+    scene.clean_up()
+    
     if args.nsys_profile:
         torch.cuda.cudart().cudaProfilerStop()
 
@@ -996,11 +997,17 @@ def training_report(
         utils.print_rank_0("\n[ITER {}] Start Testing".format(iteration))
 
         validation_configs = (
-            {"name": "test", "cameras": scene.getTestCameras(), "num_cameras": len(scene.getTestCameras())},
+            {
+                "name": "test", 
+                "cameras": scene.getTestCameras(), 
+                "cameras_info": scene.getTestCamerasInfo(),
+                "num_cameras": len(scene.getTestCamerasInfo()),
+            },
             {
                 "name": "train",
                 "cameras": scene.getTrainCameras(),
-                "num_cameras": max(len(scene.getTrainCameras()) // args.llffhold, args.bsz),
+                "cameras_info": scene.getTrainCamerasInfo(),
+                "num_cameras": max(len(scene.getTrainCamerasInfo()) // args.llffhold, args.bsz),
             },
         )
 
@@ -1127,5 +1134,132 @@ def training_report(
                         iteration, config["name"], l1_test, psnr_test
                     )
                 )
+            elif config["cameras_info"] and len(config["cameras_info"]) > 0:
+                # Dataset is offloaded to disk
+                l1_test = torch.scalar_tensor(0.0, device="cuda")
+                psnr_test = torch.scalar_tensor(0.0, device="cuda")
+
+                # TODO: if not divisible by world size
+                num_cameras = config["num_cameras"] // args.bsz * args.bsz
+                eval_dataset = TorchSceneDataset(config["cameras_info"])
+                strategy_history = DivisionStrategyHistoryFinal(
+                    eval_dataset, utils.DEFAULT_GROUP.size(), utils.DEFAULT_GROUP.rank()
+                )
+                # Init dataloader
+                if args.num_workers == 0:
+                    dataloader = DataLoader(
+                        eval_dataset,
+                        batch_size=args.bsz,
+                        # shuffle=True,
+                        drop_last=True,
+                        pin_memory=True,
+                        collate_fn=custom_collate_fn
+                    )
+                elif args.num_workers > 0:
+                    dataloader = DataLoader(
+                        eval_dataset,
+                        batch_size=args.bsz,
+                        num_workers=args.num_workers,
+                        # shuffle=True,
+                        drop_last=True,
+                        persistent_workers=True,
+                        pin_memory=True,
+                        collate_fn=custom_collate_fn
+                    )
+                dataloader_iter = iter(dataloader)
+                
+                for idx in range(1, num_cameras + 1, args.bsz):
+                    num_camera_to_load = min(args.bsz, num_cameras - idx + 1)
+                    #FIXME: may have problems when bsz > 1
+                    try:
+                        batched_cameras = next(dataloader_iter)
+                    except StopIteration:
+                        dataloader_iter = iter(dataloader)
+                        batched_cameras = next(dataloader_iter)
+                    # batched_cameras = eval_dataset.get_batched_cameras(
+                    #     num_camera_to_load
+                    # )
+                    batched_strategies, gpuid2tasks = start_strategy_final(
+                        batched_cameras, strategy_history
+                    )
+                    load_camera_from_cpu_to_all_gpu_for_eval(
+                        batched_cameras, batched_strategies, gpuid2tasks
+                    )
+                    batched_image = []
+                    for cam_id, (camera, strategy) in enumerate(zip(batched_cameras, batched_strategies)):
+                        #FIXME: quick workaround for verifying the correctness
+                        camera.world_view_transform = camera.world_view_transform.cuda()
+                        camera.full_proj_transform = camera.full_proj_transform.cuda()
+                        
+                        if backend == "gsplat":
+                            batched_screenspace_pkg = (
+                                gsplat_distributed_preprocess3dgs_and_all2all_final(
+                                    [camera],
+                                    scene.gaussians,
+                                    pipe_args,
+                                    background,
+                                    batched_strategies=[strategy],
+                                    mode="test",
+                                    offload=offload,
+                                )
+                            )
+                            images, _ = gsplat_render_final(
+                                batched_screenspace_pkg, [strategy]
+                            )
+                            batched_image.append(images[0])
+                        else:
+                            batched_screenspace_pkg = (
+                                distributed_preprocess3dgs_and_all2all_final(
+                                    [camera],
+                                    scene.gaussians,
+                                    pipe_args,
+                                    background,
+                                    batched_strategies=[strategy],
+                                    mode="test",
+                                )
+                            )
+                            images, _ = render_final(
+                                batched_screenspace_pkg, [strategy]
+                            )
+                            batched_image.append(images[0])
+                    for camera_id, (image, gt_camera) in enumerate(
+                        zip(batched_image, batched_cameras)
+                    ):
+                        if (
+                            image is None or len(image.shape) == 0
+                        ):  # The image is not rendered locally.
+                            image = torch.zeros(
+                                gt_camera.original_image.shape,
+                                device="cuda",
+                                dtype=torch.float32,
+                            )
+
+                        if utils.DEFAULT_GROUP.size() > 1:
+                            torch.distributed.all_reduce(
+                                image, op=dist.ReduceOp.SUM, group=utils.DEFAULT_GROUP
+                            )
+
+                        image = torch.clamp(image, 0.0, 1.0)
+                        gt_image = torch.clamp(
+                            gt_camera.original_image / 255.0, 0.0, 1.0
+                        )
+
+                        if idx + camera_id < num_cameras + 1:
+                            l1_test += l1_loss(image, gt_image).mean().double()
+                            psnr_test += psnr(image, gt_image).mean().double()
+                        gt_camera.original_image = None
+                psnr_test /= num_cameras
+                l1_test /= num_cameras
+                utils.print_rank_0(
+                    "\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(
+                        iteration, config["name"], l1_test, psnr_test
+                    )
+                )
+                log_file.write(
+                    "[ITER {}] Evaluating {}: L1 {} PSNR {}\n".format(
+                        iteration, config["name"], l1_test, psnr_test
+                    )
+                )
+                
 
         torch.cuda.empty_cache()

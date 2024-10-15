@@ -64,7 +64,10 @@ if __name__ == "__main__":
 
     # create cuda trace dump folder
     if args.trace_cuda_mem:
-        os.makedirs(args.model_path + "/trace_dump")
+        os.makedirs(os.path.join(args.model_path, "trace_dump"))
+    
+    if args.decode_dataset_to_disk:
+        os.makedirs(os.path.join(args.decode_dataset_path, "dataset_raw"), exist_ok=True)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
