@@ -21,6 +21,7 @@ from gaussian_renderer.loss_distribution import (
     load_camera_from_cpu_to_all_gpu,
     load_camera_from_cpu_to_all_gpu_for_eval,
     batched_loss_computation,
+    torch_compiled_loss
 )
 from utils.general_utils import prepare_output_and_logger, globally_sync_for_timer
 import utils.general_utils as utils
@@ -34,9 +35,336 @@ from diff_gaussian_rasterization import (
     send2cpu_cat_buffer,
     send2cpu_cat_buffer_osr_shs,
     send_shs2cpu_shs_buffer,
+    send_shs2gpu_stream,
+    send_shs2cpu_grad_buffer_stream
 )
 import torch.multiprocessing
 import gc
+import math
+from gsplat import (
+    rasterization,
+    fully_fused_projection,
+    spherical_harmonics,
+    isect_tiles,
+    isect_offset_encode,
+    rasterize_to_pixels,
+)
+
+def calculate_filters(
+    batched_cameras,
+    xyz_gpu,
+    opacity_gpu,
+    scaling_gpu,
+    rotation_gpu
+):
+    # calculate filters for all cameras
+    filters = []
+    with torch.no_grad():
+        Ks = []
+        viewmats = []
+        for i, camera in enumerate(batched_cameras):
+            K = camera.create_k_on_gpu()
+            viewmat = camera.world_view_transform.transpose(0, 1)  # why transpose # this is originally on gpu
+            Ks.append(K)
+            viewmats.append(viewmat)
+        batched_Ks = torch.stack(Ks)  # (B, 3, 3)
+        batched_viewmats = torch.stack(viewmats)  # (B, 4, 4)
+
+        # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
+        proj_results = (
+            fully_fused_projection(
+                means=xyz_gpu,
+                covars=None,
+                quats=rotation_gpu,
+                scales=scaling_gpu,
+                viewmats=batched_viewmats,
+                Ks=batched_Ks,
+                width=int(camera.image_width),
+                height=int(camera.image_height),
+                packed=True,
+            )# TODO: this function is too heavy to compute the filters. we can have much cheaper calculation. 
+        ) # (B, N), (B, N, 2), (B, N), (B, N, 3), (B, N)
+
+        (
+            camera_ids, # (nnz,)
+            gaussian_ids, # (nnz,)
+            _,
+            # radii_packed, # (nnz,)
+            _,
+            # means2d_packed, # (nnz, 2)
+            _,
+            # depths_packed, # (nnz,)
+            _,
+            # conics_packed, # (nnz, 3)
+            _,
+            # compensations
+        ) = proj_results
+
+        output, counts = torch.unique_consecutive(camera_ids, return_counts=True)
+        assert torch.all(output == torch.arange(len(batched_cameras)).cuda()), "Here we assume every camera sees at least one gaussian. This error can be caused by the fact that some cameras see no gaussians."
+        # TODO: here we assume every camera sees at least one gaussian.
+        counts_cpu = counts.cpu().numpy().tolist()
+        assert sum(counts_cpu) == gaussian_ids.shape[0], "sum(counts_cpu) is supposed to be equal to gaussian_ids.shape[0]"
+        gaussian_ids_per_camera = torch.split(gaussian_ids, counts_cpu)
+
+    filters = gaussian_ids_per_camera # on GPU
+    return filters
+
+
+def pipeline_forward_one_step(
+    filtered_opacity_gpu,
+    filtered_scaling_gpu,
+    filtered_rotation_gpu,
+    filtered_xyz_gpu,
+    filtered_shs,
+    camera,
+    scene,
+    gaussians,
+    background,
+    pipe_args
+):
+    # print shape of all inputs
+    # print("filtered_opacity_gpu shape: ", filtered_opacity_gpu.shape)
+    # print("filtered_scaling_gpu shape: ", filtered_scaling_gpu.shape)
+    # print("filtered_rotation_gpu shape: ", filtered_rotation_gpu.shape)
+    # print("filtered_xyz_gpu shape: ", filtered_xyz_gpu.shape)
+    # print("filtered_shs shape: ", filtered_shs.shape)
+
+    viewmat = camera.world_view_transform.transpose(0, 1)  # why transpose
+    # K = camera.create_k_on_gpu() # create K now, which may invoke cpu-gpu transfer
+    K = camera.K
+    n_selected = filtered_xyz_gpu.shape[0]
+    image_width = int(camera.image_width)
+    image_height = int(camera.image_height)
+    tile_size = 16
+    B = 1 # micro batch size is just 1
+
+    batched_radiis, batched_means2D, batched_depths, batched_conics, _ = (
+        fully_fused_projection(
+            means=filtered_xyz_gpu, # (N, 3)
+            covars=None,
+            quats=filtered_rotation_gpu,
+            scales=filtered_scaling_gpu,
+            viewmats=viewmat.unsqueeze(0),
+            Ks=K.unsqueeze(0),
+            width=int(camera.image_width),
+            height=int(camera.image_height),
+            packed=False,
+        )
+    ) # (1, N), (1, N, 2), (1, N), (1, N, 3), (1, N)
+
+    batched_means2D.retain_grad() # this is only for training. 
+
+    sh_degree = gaussians.active_sh_degree
+    camtoworlds = torch.inverse(viewmat.unsqueeze(0)) # (4, 4)
+    dirs = filtered_xyz_gpu[None, :, :] - camtoworlds[:, None, :3, 3]
+    filtered_shs = filtered_shs.reshape(1, n_selected, 16, 3)
+    batched_colors = spherical_harmonics(
+        degrees_to_use=sh_degree, dirs=dirs, coeffs=filtered_shs
+    )
+    batched_colors = torch.clamp_min(batched_colors + 0.5, 0.0) # (1, N, 3)
+    batched_opacities = filtered_opacity_gpu.squeeze(1).unsqueeze(0) # (N, 1) -> (1, N)
+
+    # NOTE: In the above code, we keep the first batch dimension, even if it is always 1. 
+
+    # render
+    # Identify intersecting tiles.
+    tile_width = math.ceil(image_width / float(tile_size))
+    tile_height = math.ceil(image_height / float(tile_size))
+
+    # flatten_ids: (C*N)
+    _, isect_ids, flatten_ids = isect_tiles(
+        means2d=batched_means2D,
+        radii=batched_radiis,
+        depths=batched_depths,
+        tile_size=tile_size,
+        tile_width=tile_width,
+        tile_height=tile_height,
+        packed=False,
+    )
+    isect_offsets = isect_offset_encode(
+        isect_ids, B, tile_width, tile_height
+    )  # (B, tile_height, tile_width)
+
+    # no need for now
+    # global max_num_intersection
+    # num_intersection = isect_ids.shape[0]
+    # max_num_intersection = max(max_num_intersection, num_intersection)    
+    # args = utils.get_args()
+    # iteration = utils.get_cur_iter()
+    # log_file = utils.get_log_file()
+    # if (iteration % args.log_interval) == 1:
+    #     log_file.write(
+    #         "<<< # iteration: {}, # intersections = {}, max # intersections = {} >>>\n".format(iteration, num_intersection, max_num_intersection)
+    #     )
+
+    # TODO: One way to do load balancing: Add two timer operators before and after `rasterize_to_pixels`
+    # record_time_start : torch operator(torch.autograd.func)
+
+    # Rasterize to pixels. batched_rendered_image: (B, image_height, image_width, 3)
+    backgrounds = (
+        background.repeat(B, 1) if background is not None else None
+    )
+    rendered_image, _ = rasterize_to_pixels(
+        means2d=batched_means2D,
+        conics=batched_conics,
+        colors=batched_colors,
+        opacities=batched_opacities,
+        image_width=image_width,
+        image_height=image_height,
+        tile_size=tile_size,
+        isect_offsets=isect_offsets,
+        flatten_ids=flatten_ids,
+        backgrounds=backgrounds,
+    )
+
+    rendered_image = rendered_image.squeeze(0).permute(2, 0, 1).contiguous()
+
+    return rendered_image
+
+def pipeline_offload_impl(
+    gaussians,
+    scene,
+    batched_cameras,
+    parameters_grad_buffer,
+    background,
+    pipe_args
+):
+    args = utils.get_args()
+
+    # prepare all parameters
+    xyz_gpu = gaussians.get_xyz
+    opacity_gpu_origin = gaussians.get_opacity
+    scaling_gpu_origin = gaussians.get_scaling
+    rotation_gpu_origin = gaussians.get_rotation
+
+    # calculate gaussian visible filters for all cameras
+    filters = calculate_filters(
+        batched_cameras,
+        xyz_gpu,
+        opacity_gpu_origin,
+        scaling_gpu_origin,
+        rotation_gpu_origin
+    ) # list of GPU long tensors. len(cameras)
+
+    # accumulate gradients at opacity_gpu, scaling_gpu, rotation_gpu since they are computed afer the activation functions.
+    # no need for xyz since it does not have activation function.
+    opacity_gpu = opacity_gpu_origin.detach().requires_grad_()
+    scaling_gpu = scaling_gpu_origin.detach().requires_grad_()
+    rotation_gpu = rotation_gpu_origin.detach().requires_grad_()
+
+    # declare streams for computationa and communication
+    comm_stream = torch.cuda.Stream(device=0)
+    default_stream = torch.cuda.current_stream()
+
+    # start the training pipeline
+    num_micro_batches = len(batched_cameras)
+    N = gaussians._xyz.shape[0]
+    losses = []
+    for micro_idx in range(num_micro_batches):
+        torch.cuda.nvtx.range_push("micro_batch_idx: " + str(micro_idx))
+
+        # load the parameters for the first sample in the batch
+        if micro_idx == 0:
+            with torch.cuda.stream(comm_stream):
+                # Forward pass
+                shs = torch.empty(filters[micro_idx].shape[0], 48, device="cuda", requires_grad=True)
+                # print("shs shape: ", shs.shape)
+                # print("_parameters shape: ", gaussians._parameters.shape)
+                # print("filters shape: ", filters[micro_idx].shape)
+                send_shs2gpu_stream(
+                    shs,
+                    gaussians._parameters,# Why this is a detach? May be this is redundant? 
+                    filters[micro_idx],
+                )
+                # create an event
+                cpu2gpu_event = torch.cuda.Event(enable_timing=True)
+                cpu2gpu_event.record(comm_stream)
+        else:
+            shs = shs_next # need to verify that is this the correct way to do this? 
+
+        # sync event of comm_stream with default_stream
+        cpu2gpu_event.wait(default_stream)
+
+        with torch.cuda.stream(comm_stream):
+            # Forward pass
+            if micro_idx < num_micro_batches - 1:
+                shs_next = torch.empty(filters[micro_idx+1].shape[0], 48, device="cuda", requires_grad=True)
+                # print("shs shape: ", shs_next.shape)
+                # print("_parameters shape: ", gaussians._parameters.shape)
+                # print("filters shape: ", filters[micro_idx+1].shape)
+                send_shs2gpu_stream(
+                    shs_next,
+                    gaussians._parameters,
+                    filters[micro_idx + 1],
+                )
+                # create an event
+                cpu2gpu_event = torch.cuda.Event(enable_timing=True)
+                cpu2gpu_event.record(comm_stream)
+
+            shs_grad = torch.empty_like(shs)
+
+        torch.cuda.nvtx.range_push("forward_pass")
+        this_filter = filters[micro_idx]
+        filtered_xyz_gpu = xyz_gpu[this_filter]
+        filtered_opacity_gpu = opacity_gpu[this_filter]
+        filtered_scaling_gpu = scaling_gpu[this_filter]
+        filtered_rotation_gpu = rotation_gpu[this_filter] # TODO: change to torch.gather which is faster. 
+        filtered_shs = shs.requires_grad_() # this is a view of the original shs.
+
+        # preprocess
+        rendered_image = pipeline_forward_one_step(filtered_opacity_gpu,
+                                                filtered_scaling_gpu,
+                                                filtered_rotation_gpu,
+                                                filtered_xyz_gpu,
+                                                filtered_shs,
+                                                batched_cameras[micro_idx],
+                                                scene,
+                                                gaussians,
+                                                background,
+                                                pipe_args)
+
+        loss = torch_compiled_loss(rendered_image, batched_cameras[micro_idx].original_image)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("backward_pass")
+        loss.backward()
+        torch.cuda.nvtx.range_pop()
+        # move shs.grad into shs_grad
+        shs_grad.copy_(shs.grad)
+
+        losses.append(loss.detach())
+
+        gpu2cpu_event = torch.cuda.Event(enable_timing=True)
+        gpu2cpu_event.record(default_stream)
+
+        with torch.cuda.stream(comm_stream):
+            gpu2cpu_event.wait(comm_stream)
+            # sync event of default_stream with comm_stream
+            # timers.start("fused grad transfer") # rewrite the timer function.
+            send_shs2cpu_grad_buffer_stream(
+                shs_grad,
+                parameters_grad_buffer[:N, :],
+                filters[micro_idx],
+                accum=True
+            )
+            # timers.stop("fused grad transfer")
+
+            # TODO: Free grads on gpu, I am not sure whether this is safe or not. 
+            # We need to double check this. 
+            # shs.grad = None
+
+
+
+
+
+        torch.cuda.nvtx.range_pop()
+
+    torch.cuda.synchronize()
+    opacity_gpu_origin.backward(opacity_gpu.grad)
+    scaling_gpu_origin.backward(scaling_gpu.grad)
+    rotation_gpu_origin.backward(rotation_gpu.grad)
+
+    return losses
 
 def training(dataset_args, opt_args, pipe_args, args, log_file):
 
@@ -175,7 +503,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         timers.clear()
         timers.start("[iteration end2end]")
         if args.nsys_profile:
-            assert args.bsz == 1, "nsys profiling only supports batch size 1"
+            # assert args.bsz == 1, "nsys profiling only supports batch size 1"
             if iteration == args.nsys_profile_start_iter:
                 torch.cuda.cudart().cudaProfilerStart()
             if iteration == args.nsys_profile_end_iter or iteration == opt_args.iterations:
@@ -206,6 +534,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 camera.world_view_transform = camera.world_view_transform.cuda()
                 # camera.projection_matrix = camera.projection_matrix.cuda()
                 camera.full_proj_transform = camera.full_proj_transform.cuda()
+                camera.K = camera.create_k_on_gpu()
+                # TODO: maybe we can save them on gpu during initialization. After all, they do not take up lots of memory.
             timers.stop("send cam matrices to gpu")
             
         else:
@@ -226,7 +556,46 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             )
             timers.stop("load_cameras")
 
-        if args.offload:
+        if args.pipelined_offload:
+            assert args.offload, "Pipelined offload requires offloading"
+            assert args.bsz > 1, "Pipelined offload requires batch size > 1"
+            assert args.gpu_cache == "xyzosr", "Pipelined offload requires xyzosr cache"
+
+            N = gaussians._xyz.shape[0]
+            losses = pipeline_offload_impl(
+                gaussians,
+                scene,
+                batched_cameras,
+                parameters_grad_buffer,
+                background,
+                pipe_args
+            )
+            batched_screenspace_pkg = {}
+
+            gaussians._parameters.grad = parameters_grad_buffer[:N, :]
+            
+            # Sync losses in the batch
+            timers.start("sync_loss_and_log")
+            batched_losses = torch.stack(losses)
+            batched_loss_cpu = batched_losses.cpu().numpy()
+            ema_loss_for_log = (
+                batched_loss_cpu.mean()
+                if ema_loss_for_log is None
+                else 0.6 * ema_loss_for_log + 0.4 * batched_loss_cpu.mean()
+            )
+            # Update Epoch Statistics
+            train_dataset.update_losses(batched_loss_cpu)
+            # Logging
+            batched_loss_cpu = [round(loss, 6) for loss in batched_loss_cpu]
+            log_string = "iteration[{},{}), loss: {} image: {}\n".format(
+                iteration,
+                iteration + args.bsz,
+                batched_loss_cpu,
+                [viewpoint_cam.image_name for viewpoint_cam in batched_cameras],
+            )
+            log_file.write(log_string)
+
+        elif args.offload:
             assert utils.DEFAULT_GROUP.size() == 1, "Offloading is implemented only for one GPU"
             N = gaussians._xyz.shape[0]
             

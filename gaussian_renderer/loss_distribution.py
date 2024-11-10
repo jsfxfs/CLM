@@ -2665,3 +2665,67 @@ def batched_loss_computation(
     assert loss_sum.dim() == 0, "The loss_sum must be a scalar tensor."
     timers.stop("loss_computation")
     return loss_sum * args.lr_scale_loss, batched_losses
+
+
+
+class FinalLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lambda_dssim = 0.2 # TODO: allow this to be set by the user
+    
+    def forward(self, image, image_gt_original):
+        image_gt = torch.clamp(image_gt_original / 255.0, 0.0, 1.0)
+        Ll1 = l1_loss(image, image_gt)
+        ssim_loss = ssim(image, image_gt)
+        loss = (1.0 - self.lambda_dssim) * Ll1 + self.lambda_dssim * (
+                1.0 - ssim_loss
+            )
+        return loss
+
+@torch.compile
+def compiledl1andssimloss(image, image_gt_original):
+    lambda_dssim = 0.2
+    image_gt = torch.clamp(image_gt_original / 255.0, 0.0, 1.0)
+    Ll1 = l1_loss(image, image_gt)
+    ssim_loss = ssim(image, image_gt)
+    loss = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (
+            1.0 - ssim_loss
+        )
+    return loss
+
+@torch.compile
+def loss_combined(image, image_gt, ssim_loss):
+    lambda_dssim = 0.2 # TODO: allow this to be set by the user
+    Ll1 = l1_loss(image, image_gt)
+    loss = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (
+                1.0 - ssim_loss
+            )
+    return loss
+
+class FusedCompiledLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, image, image_gt_original):
+        image_gt = torch.clamp(image_gt_original / 255.0, 0.0, 1.0)
+        ssim_loss = fused_ssim(image.unsqueeze(0), image_gt.unsqueeze(0))
+        return loss_combined(image, image_gt, ssim_loss)
+
+UNCOMPILED_LOSS_MODULE = FinalLoss()
+COMPILED_LOSS_MODULE = torch.compile(FinalLoss())
+FUSED_COMPILED_LOSS_MODULE = FusedCompiledLoss()
+
+def torch_compiled_loss(image, image_gt_original):
+    # global COMPILED_LOSS_MODULE
+    # loss = COMPILED_LOSS_MODULE(image, image_gt_original)
+
+    # args = utils.get_args()
+
+    fused_loss = True
+    if fused_loss:
+        global FUSED_COMPILED_LOSS_MODULE
+        loss = FUSED_COMPILED_LOSS_MODULE(image, image_gt_original)
+    else:
+        loss = compiledl1andssimloss(image, image_gt_original)
+
+    return loss

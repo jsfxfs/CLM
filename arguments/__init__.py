@@ -77,6 +77,7 @@ class AuxiliaryParams(ParamGroup):
         self.llffhold = 8
         self.backend = "default" # "default", "gsplat"
         self.offload = False
+        self.pipelined_offload = False
         self.prealloc_capacity = 5_000_000
         self.fused_loss = "advanced_fuse" # "default", "hand_written", "torch_compile", "advanced_fuse"s
         self.accumulate_grads = False
@@ -324,6 +325,11 @@ def init_args(args):
 
     if not args.gaussians_distribution:
         args.distributed_save = False
+    
+    if args.pipelined_offload:
+        assert args.offload, "pipelined_offload works only when offload==True"
+        assert args.bsz > 1, "pipelined_offload works only when bsz > 1"
+        assert args.gpu_cache == "xyzosr", "now pipelined_offload works only when gpu_cache == xyzosr"
 
     # sort test_iterations
     args.test_iterations.sort()

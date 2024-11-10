@@ -16,7 +16,7 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 from utils.general_utils import get_args, get_log_file
 import utils.general_utils as utils
 import time
-
+import math
 
 class Camera(nn.Module):
     def __init__(
@@ -100,6 +100,26 @@ class Camera(nn.Module):
             )
         ).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+        # self.K = self.create_k_on_gpu()
+    
+    def create_k_on_gpu(self):
+        # Set up rasterization configuration
+        image_width = int(self.image_width)
+        image_height = int(self.image_height)
+        tanfovx = math.tan(self.FoVx * 0.5)
+        tanfovy = math.tan(self.FoVy * 0.5)
+        focal_length_x = self.image_width / (2 * tanfovx)
+        focal_length_y = self.image_height / (2 * tanfovy)
+        K = torch.tensor(
+            [
+                [focal_length_x, 0, self.image_width / 2.0],
+                [0, focal_length_y, self.image_height / 2.0],
+                [0, 0, 1],
+            ],
+            device="cuda",
+        )
+        return K
 
     def get_camera2world(self):
         return self.world_view_transform_backup.t().inverse()
