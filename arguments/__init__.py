@@ -221,6 +221,9 @@ class DebugParams(ParamGroup):
         self.do_not_save = False # Do not save model
         self.reset_each_iter = False # Reset max memory for  each iteration
 
+        self.manual_gc = False
+        self.offload_shs_grad_before_every_microbatch = False
+
         super().__init__(parser, "Debug Parameters")
 
 

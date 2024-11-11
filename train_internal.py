@@ -156,7 +156,8 @@ def pipeline_forward_one_step(
     batched_means2D.retain_grad() # this is only for training. 
 
     sh_degree = gaussians.active_sh_degree
-    camtoworlds = torch.inverse(viewmat.unsqueeze(0)) # (4, 4)
+    camtoworlds = camera.camtoworlds
+    # camtoworlds = torch.inverse(viewmat.unsqueeze(0)) # (4, 4)
     dirs = filtered_xyz_gpu[None, :, :] - camtoworlds[:, None, :3, 3]
     filtered_shs = filtered_shs.reshape(1, n_selected, 16, 3)
     batched_colors = spherical_harmonics(
@@ -261,6 +262,8 @@ def pipeline_offload_impl(
     num_micro_batches = len(batched_cameras)
     N = gaussians._xyz.shape[0]
     losses = []
+    shs_grad = None
+    grid_size, block_size = 16, 256
     for micro_idx in range(num_micro_batches):
         torch.cuda.nvtx.range_push("micro_batch_idx: " + str(micro_idx))
 
@@ -276,15 +279,14 @@ def pipeline_offload_impl(
                     shs,
                     gaussians._parameters,# Why this is a detach? May be this is redundant? 
                     filters[micro_idx],
+                    grid_size, block_size
                 )
                 # create an event
                 cpu2gpu_event = torch.cuda.Event(enable_timing=True)
                 cpu2gpu_event.record(comm_stream)
         else:
             shs = shs_next # need to verify that is this the correct way to do this? 
-
-        # sync event of comm_stream with default_stream
-        cpu2gpu_event.wait(default_stream)
+            cpu2gpu_event = next_cpu2gpu_event
 
         with torch.cuda.stream(comm_stream):
             # Forward pass
@@ -297,19 +299,37 @@ def pipeline_offload_impl(
                     shs_next,
                     gaussians._parameters,
                     filters[micro_idx + 1],
+                    grid_size, block_size
                 )
                 # create an event
-                cpu2gpu_event = torch.cuda.Event(enable_timing=True)
-                cpu2gpu_event.record(comm_stream)
+                next_cpu2gpu_event = torch.cuda.Event(enable_timing=True)
+                next_cpu2gpu_event.record(comm_stream)
 
+        with torch.cuda.stream(comm_stream):
+            last_microbatch_shs_grad = shs_grad
             shs_grad = torch.empty_like(shs)
+
+        if args.offload_shs_grad_before_every_microbatch and micro_idx > 0:
+            with torch.cuda.stream(comm_stream):
+                gpu2cpu_event.wait(comm_stream)
+                # sync event of default_stream with comm_stream
+                # timers.start("fused grad transfer") # rewrite the timer function.
+                send_shs2cpu_grad_buffer_stream(
+                    last_microbatch_shs_grad,
+                    parameters_grad_buffer[:N, :],
+                    filters[micro_idx-1],
+                    True,
+                    grid_size, block_size
+                )
 
         torch.cuda.nvtx.range_push("forward_pass")
         this_filter = filters[micro_idx]
-        filtered_xyz_gpu = xyz_gpu[this_filter]
-        filtered_opacity_gpu = opacity_gpu[this_filter]
-        filtered_scaling_gpu = scaling_gpu[this_filter]
-        filtered_rotation_gpu = rotation_gpu[this_filter] # TODO: change to torch.gather which is faster. 
+        filtered_xyz_gpu = torch.gather(xyz_gpu, 0, this_filter.reshape(-1, 1).expand(-1, 3))
+        filtered_opacity_gpu = torch.gather(opacity_gpu, 0, this_filter.reshape(-1, 1))
+        filtered_scaling_gpu = torch.gather(scaling_gpu, 0, this_filter.reshape(-1, 1).expand(-1, 3))
+        filtered_rotation_gpu = torch.gather(rotation_gpu, 0, this_filter.reshape(-1, 1).expand(-1, 4))
+        # sync event of comm_stream with default_stream to make sure shs has been loaded to gpu
+        cpu2gpu_event.wait(default_stream)
         filtered_shs = shs.requires_grad_() # this is a view of the original shs.
 
         # preprocess
@@ -337,6 +357,27 @@ def pipeline_offload_impl(
         gpu2cpu_event = torch.cuda.Event(enable_timing=True)
         gpu2cpu_event.record(default_stream)
 
+        if not args.offload_shs_grad_before_every_microbatch:
+            with torch.cuda.stream(comm_stream):
+                gpu2cpu_event.wait(comm_stream)
+                # sync event of default_stream with comm_stream
+                # timers.start("fused grad transfer") # rewrite the timer function.
+                send_shs2cpu_grad_buffer_stream(
+                    shs_grad,
+                    parameters_grad_buffer[:N, :],
+                    filters[micro_idx],
+                    True,
+                    grid_size, block_size,
+                )
+                # timers.stop("fused grad transfer")
+
+                # TODO: Free grads on gpu, I am not sure whether this is safe or not. 
+                # We need to double check this. 
+                # shs.grad = None
+
+        torch.cuda.nvtx.range_pop()
+
+    if args.offload_shs_grad_before_every_microbatch:
         with torch.cuda.stream(comm_stream):
             gpu2cpu_event.wait(comm_stream)
             # sync event of default_stream with comm_stream
@@ -344,20 +385,11 @@ def pipeline_offload_impl(
             send_shs2cpu_grad_buffer_stream(
                 shs_grad,
                 parameters_grad_buffer[:N, :],
-                filters[micro_idx],
-                accum=True
+                filters[-1],
+                True,
+                16, 256,
             )
-            # timers.stop("fused grad transfer")
 
-            # TODO: Free grads on gpu, I am not sure whether this is safe or not. 
-            # We need to double check this. 
-            # shs.grad = None
-
-
-
-
-
-        torch.cuda.nvtx.range_pop()
 
     torch.cuda.synchronize()
     opacity_gpu_origin.backward(opacity_gpu.grad)
@@ -470,6 +502,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     progress_bar.update(start_from_this_iteration - 1)
     num_trained_batches = 0
 
+    if args.manual_gc:
+        gc.disable()
+        gc.collect()
+
     ema_loss_for_log = 0
     means3D_all = None # A handle to means3D_all on gpu
     send2gpu_filter = None # A handle to send2gpu_filter on gpu
@@ -534,7 +570,17 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 camera.world_view_transform = camera.world_view_transform.cuda()
                 # camera.projection_matrix = camera.projection_matrix.cuda()
                 camera.full_proj_transform = camera.full_proj_transform.cuda()
-                camera.K = camera.create_k_on_gpu()
+
+            if args.pipelined_offload:
+                batched_world_view_transform = []
+                for camera in batched_cameras:
+                    camera.K = camera.create_k_on_gpu()
+                    batched_world_view_transform.append(camera.world_view_transform.transpose(0, 1))
+                batched_world_view_transform = torch.stack(batched_world_view_transform)
+                batched_world_view_transform_inverse = torch.inverse(batched_world_view_transform)
+                batched_world_view_transform_inverse = torch.unbind(batched_world_view_transform_inverse, dim=0)
+                for camera, wvt in zip(batched_cameras, batched_world_view_transform_inverse):
+                    camera.camtoworlds = wvt.unsqueeze(0)
                 # TODO: maybe we can save them on gpu during initialization. After all, they do not take up lots of memory.
             timers.stop("send cam matrices to gpu")
             
@@ -1046,6 +1092,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         if utils.check_enable_python_timer():
             timers.stop("[iteration end2end]")
             timers.printTimers(iteration, mode="sum")
+            if args.manual_gc:
+                gc.collect()
         if args.trace_cuda_mem:
             if (iteration % args.log_interval) == 1 or (iteration % args.densification_interval) == 0:
                 dump_name = args.model_path + f"/trace_dump/iter={iteration}"
