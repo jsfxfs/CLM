@@ -342,8 +342,8 @@ class GaussianModel:
             
             self._parameters = nn.Parameter(self.parameters_buffer[:N].requires_grad_(True))
             self._features_dc, self._features_rest = torch.split(self._parameters, dims, dim=1) 
-            self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cpu")
-            self.sum_visible_count_in_one_batch = torch.zeros((self.get_xyz.shape[0]), device="cpu")
+            self.max_radii2D = torch.zeros((N), device="cuda")
+            self.sum_visible_count_in_one_batch = torch.zeros((N), device="cuda")
             
             self.param_dims = torch.tensor(dims, dtype=torch.int, device='cuda')
             # self.param_dims_presum_rshift = torch.cumsum(self.param_dims, dtype=torch.int, dim=0) - self.param_dims
@@ -807,10 +807,16 @@ class GaussianModel:
         opacities_new = inverse_sigmoid(
             torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01)
         )
-        if self.device == 'cpu' and self.mxw_debug == 'cat':
-            self._parameters[:, 3:4] = opacities_new
-            self.cat_replace_opacities_to_optimizer(opacities_new, "parameters")
-            self._opacity = self._parameters[:, 3:4]
+        if self.args.offload:
+            if self.args.gpu_cache == "no_cache":
+                self._parameters[:, 3:4] = opacities_new
+                self.cat_replace_opacities_to_optimizer(opacities_new, "parameters")
+                self._opacity = self._parameters[:, 3:4]
+            elif self.args.gpu_cache == "xyzosr":
+                optimizable_tensors = self.replace_tensor_to_unified_adam(opacities_new, "opacity")
+                self._opacity = optimizable_tensors["opacity"]
+            else:
+                raise ValueError("Invalid gpu cache strategy.")
         else:
             optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
             self._opacity = optimizable_tensors["opacity"]
@@ -872,7 +878,7 @@ class GaussianModel:
             if self.args.gpu_cache == "no_cache":
                 self.parameters_buffer = torch.empty((self.args.prealloc_capacity, 59), dtype=torch.float, pin_memory=True)
                 self.parameters_grad_buffer = torch.zeros((self.args.prealloc_capacity, 59), dtype=torch.float, pin_memory=True)
-                self.parameters_buffer[:N] = np.concatenate((catted_xyz, catted_opacity, catted_scaling, catted_rotation, catted_features_dc, catted_features_rest), axis=1)
+                self.parameters_buffer[:N] = torch.tensor(np.concatenate((catted_xyz, catted_opacity, catted_scaling, catted_rotation, catted_features_dc, catted_features_rest), axis=1))
                 self._parameters = nn.Parameter(
                     self.parameters_buffer[:N].requires_grad_(True)
                 )
@@ -1145,60 +1151,158 @@ class GaussianModel:
 
                     optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
+    
+    def replace_tensor_to_unified_adam(self, tensor, name):
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            if group["name"] == name:
+                assert group["params"][0].is_cuda, "Not implemented for parameters on cpu yet."
+                stored_state = self.optimizer.gpu_adam.state.get(group["params"][0], None)
+                assert stored_state is not None, "UnifiedAdam is a stateful optimizer."
+                if "exp_avg" not in stored_state:
+                    stored_state["momentum_buffer"] = torch.zeros_like(tensor)
+                else:
+                    stored_state["exp_avg"] = torch.zeros_like(tensor)
+                    stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                
+                del self.optimizer.gpu_adam.state[group["params"][0]]
+                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+                self.optimizer.gpu_adam.state[group["params"][0]] = stored_state
+                optimizable_tensors[group["name"]] = group["params"][0]
 
+        return optimizable_tensors
+    
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group["params"][0], None)
+            mask = mask.to(group["params"][0].device.type)
             if stored_state is not None:
                 if "exp_avg" not in stored_state:
-                    stored_state["momentum_buffer"] = stored_state["momentum_buffer"][
-                        mask
-                    ]
+                    stored_state["momentum_buffer"] = stored_state["momentum_buffer"][mask]
                 else:
                     stored_state["exp_avg"] = stored_state["exp_avg"][mask]
                     stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
                 del self.optimizer.state[group["params"][0]]
-                if self.device == 'cpu' and (self.mxw_debug == 'fused' or self.mxw_debug == 'cat'):
-                    group["params"][0] = nn.Parameter(
-                        (group["params"][0][mask].requires_grad_(True)).pin_memory()
-                    )
-                    self.optimizer.state[group["params"][0]] = stored_state
-                    
-                    if "momentum_buffer" in stored_state:
-                        assert self.optimizer.state[group["params"][0]]["momentum_buffer"].is_pinned() == False, "momentum_buffer should be in pageable memory"
-                    if "exp_avg" in stored_state:
-                        assert self.optimizer.state[group["params"][0]]["exp_avg"].is_pinned() == False, "exp_avg should be in pageable memory"
-                    if "exp_avg_sq" in stored_state:
-                        assert self.optimizer.state[group["params"][0]]["exp_avg_sq"].is_pinned() == False, "exp_avg_sq should be in pageable memory"
-                else:
+                
+                if group["params"][0].is_cuda:
                     group["params"][0] = nn.Parameter(
                         (group["params"][0][mask].requires_grad_(True))
                     )
-                    self.optimizer.state[group["params"][0]] = stored_state
-
-                optimizable_tensors[group["name"]] = group["params"][0]
-            else:
-                if self.device == 'cpu' and (self.mxw_debug == 'fused' or self.mxw_debug == 'cat'):
+                else:
+                    assert mask.dim() == 1
+                    self.parameters_buffer[:torch.sum(mask)] = group["params"][0][mask]
                     group["params"][0] = nn.Parameter(
-                        group["params"][0][mask].requires_grad_(True).pin_memory()
+                        (self.parameters_buffer[:torch.sum(mask)].requires_grad_(True))
+                    )
+
+                self.optimizer.state[group["params"][0]] = stored_state
+                optimizable_tensors[group["name"]] = group["params"][0]    
+            else:
+                if group["params"][0].is_cuda:
+                    group["params"][0] = nn.Parameter(
+                        (group["params"][0][mask].requires_grad_(True))
                     )
                 else:
+                    assert mask.dim() == 1
+                    self.parameters_buffer[:torch.sum(mask)] = group["params"][0][mask]
                     group["params"][0] = nn.Parameter(
-                        group["params"][0][mask].requires_grad_(True)
+                        (self.parameters_buffer[:torch.sum(mask)].requires_grad_(True))
                     )
                 optimizable_tensors[group["name"]] = group["params"][0]
+                
+        return optimizable_tensors
+    
+    def _prune_unified_adam(self, mask):
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            if group["params"][0].is_cuda:
+                stored_state = self.optimizer.gpu_adam.state.get(group["params"][0], None)
+                mask = mask.to(group["params"][0].device.type)
+                assert stored_state is not None, "Unified adam is a stateful optimizer."
+
+                if "exp_avg" not in stored_state:
+                    stored_state["momentum_buffer"] = stored_state["momentum_buffer"][mask]
+                else:
+                    stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                    stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+
+                del self.optimizer.gpu_adam.state[group["params"][0]]
+
+                group["params"][0] = nn.Parameter(
+                    (group["params"][0][mask].requires_grad_(True))
+                )
+
+                self.optimizer.gpu_adam.state[group["params"][0]] = stored_state
+                optimizable_tensors[group["name"]] = group["params"][0]
+            
+            else:
+                stored_state = self.optimizer.cpu_adam.state.get(group["params"][0], None)
+                mask = mask.to(group["params"][0].device.type)
+                assert stored_state is not None, "Unified adam is a stateful optimizer."
+
+                if "exp_avg" not in stored_state:
+                    stored_state["momentum_buffer"] = stored_state["momentum_buffer"][mask]
+                else:
+                    stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                    stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+
+                del self.optimizer.cpu_adam.state[group["params"][0]]
+
+                assert mask.dim() == 1
+                self.parameters_buffer[:torch.sum(mask)] = group["params"][0][mask]
+                group["params"][0] = nn.Parameter(
+                    (self.parameters_buffer[:torch.sum(mask)].requires_grad_(True))
+                )
+
+                self.optimizer.cpu_adam.state[group["params"][0]] = stored_state
+                optimizable_tensors[group["name"]] = group["params"][0]
+
+        self.optimizer.state = self.optimizer.gpu_adam.state | self.optimizer.cpu_adam.state   
         return optimizable_tensors
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
-        optimizable_tensors = self._prune_optimizer(valid_points_mask)
+        if self.args.offload and self.args.gpu_cache == "xyzosr":
+            optimizable_tensors = self._prune_unified_adam(valid_points_mask)
+        else:
+            optimizable_tensors = self._prune_optimizer(valid_points_mask)
         
-        if self.device == 'cpu' and self.mxw_debug == 'cat':
-            self._parameters = optimizable_tensors["parameters"]
-            dims = [self._xyz.shape[1], self._opacity.shape[1], self._scaling.shape[1], self._rotation.shape[1], self._features_dc.shape[1], self._features_rest.shape[1]]           
-            self._xyz, self._opacity, self._scaling, self._rotation, self._features_dc, self._features_rest = torch.split(self._parameters, dims, dim=1)
+        if self.args.offload:
+            if self.args.gpu_cache == "no_cache":
+                self._parameters = optimizable_tensors["parameters"]
+                dims = [self._xyz.shape[1], self._opacity.shape[1], self._scaling.shape[1], self._rotation.shape[1], self._features_dc.shape[1], self._features_rest.shape[1]]           
+                self._xyz, self._opacity, self._scaling, self._rotation, self._features_dc, self._features_rest = torch.split(self._parameters, dims, dim=1)
+                
+                assert self._parameters.is_pinned()
+                assert self._xyz.is_pinned()
+                assert self._opacity.is_pinned()
+                assert self._scaling.is_pinned()
+                assert self._rotation.is_pinned()
+                assert self._features_dc.is_pinned()
+                assert self._features_rest.is_pinned()
+                
+            elif self.args.gpu_cache == "xyzosr":
+                self._xyz = optimizable_tensors["xyz"]
+                self._opacity = optimizable_tensors["opacity"]
+                self._scaling = optimizable_tensors["scaling"]
+                self._rotation = optimizable_tensors["rotation"]
+                self._parameters = optimizable_tensors["parameters"]
+                dims = [3, 45]           
+                self._features_dc, self._features_rest = torch.split(self._parameters, dims, dim=1)
+                
+                assert self._xyz.is_cuda
+                assert self._opacity.is_cuda
+                assert self._scaling.is_cuda
+                assert self._rotation.is_cuda
+                assert self._parameters.is_pinned()
+                assert self._features_dc.is_pinned()
+                assert self._features_rest.is_pinned()
+            
+            else:
+                raise ValueError("Invalid gpu cache strategy.")
+            
         else:
             self._xyz = optimizable_tensors["xyz"]
             self._features_dc = optimizable_tensors["f_dc"]
@@ -1217,6 +1321,18 @@ class GaussianModel:
             valid_points_mask
         ]
         
+        
+        if self.device == 'cpu' and self.mxw_debug == 'fused':
+            assert self._xyz.is_pinned(), "`[after prunning] self._xyz` is not in pinned memory"
+            assert self._scaling.is_pinned(), "`[after prunning] self._scaling` is not in pinned memory"
+            assert self._rotation.is_pinned(), "`[after prunning] self._rotation` is not in pinned memory"
+            assert self._opacity.is_pinned(), "`[after prunning] self._opacity` is not in pinned memory"
+            assert self._features_dc.is_pinned(), "`[after prunning] self._features_dc` is not in pinned memory"
+            assert self._features_rest.is_pinned(), "`[after prunning] self._features_rest` is not in pinned memory"
+        elif self.device == 'cpu' and self.mxw_debug == 'cat':
+            assert self._parameters.is_pinned(), "`[after prunning] self._parameters` is not in pinned memory"
+
+
         if self.device == 'cpu' and self.mxw_debug == 'fused':
             assert self._xyz.is_pinned(), "`[after prunning] self._xyz` is not in pinned memory"
             assert self._scaling.is_pinned(), "`[after prunning] self._scaling` is not in pinned memory"
@@ -1230,10 +1346,13 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            if tensors_dict[group["name"]] is None:
+                continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group["params"][0], None)
             if stored_state is not None:
+                # Update optimizer states.
                 if "exp_avg" not in stored_state:
                     stored_state["momentum_buffer"] = torch.cat(
                         (
@@ -1257,44 +1376,126 @@ class GaussianModel:
 
                 del self.optimizer.state[group["params"][0]]
                 
-                if self.device == 'cpu' and (self.mxw_debug == 'fused' or self.mxw_debug == 'cat'):
-                    group["params"][0] = nn.Parameter(
-                        torch.cat(
-                            (group["params"][0], extension_tensor), dim=0
-                        ).requires_grad_(True).pin_memory()
-                    ) 
-                    self.optimizer.state[group["params"][0]] = stored_state
-                    
-                    if "momentum_buffer" in stored_state:
-                        assert self.optimizer.state.get(group["params"][0], None)["momentum_buffer"].is_pinned() == False, "momentum_buffer should be in pageable memory"
-                    if "exp_avg" in stored_state:
-                        assert self.optimizer.state.get(group["params"][0], None)["exp_avg"].is_pinned() == False, "exp_avg should be in pageable memory"
-                    if "exp_avg_sq" in stored_state:
-                        assert self.optimizer.state.get(group["params"][0], None)["exp_avg_sq"].is_pinned() == False, "exp_avg_sq should be in pageable memory"
-                else:
+                # Update parameters.
+                if group["params"][0].is_cuda:
                     group["params"][0] = nn.Parameter(
                         torch.cat(
                             (group["params"][0], extension_tensor), dim=0
                         ).requires_grad_(True)
                     )
-                    self.optimizer.state[group["params"][0]] = stored_state
-
+                else:
+                    N = group["params"][0].shape[0]
+                    N_ext = extension_tensor.shape[0]
+                    self.parameters_buffer[N:(N + N_ext)] = extension_tensor
+                    group["params"][0] = nn.Parameter(
+                        self.parameters_buffer[:(N + N_ext)].requires_grad_(True)
+                    )
+                self.optimizer.state[group["params"][0]] = stored_state
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                if self.device == 'cpu' and (self.mxw_debug == 'fused' or self.mxw_debug == 'cat'):
-                    group["params"][0] = nn.Parameter(
-                        torch.cat(
-                            (group["params"][0], extension_tensor), dim=0
-                        ).requires_grad_(True).pin_memory()
-                    )
-                else:
+                if group["params"][0].is_cuda:
                     group["params"][0] = nn.Parameter(
                         torch.cat(
                             (group["params"][0], extension_tensor), dim=0
                         ).requires_grad_(True)
                     )
+                else:
+                    N = group["params"][0].shape[0]
+                    N_ext = extension_tensor.shape[0]
+                    self.parameters_buffer[N:(N + N_ext)] = extension_tensor
+                    group["params"][0] = nn.Parameter(
+                        self.parameters_buffer[:(N + N_ext)].requires_grad_(True)
+                    )
                 optimizable_tensors[group["name"]] = group["params"][0]
 
+        return optimizable_tensors
+    
+
+    def cat_tensors_to_unified_adam(self, tensors_dict):
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            if tensors_dict[group["name"]] is None:
+                continue
+            assert len(group["params"]) == 1
+            extension_tensor = tensors_dict[group["name"]]
+
+            # stored_state = self.optimizer.state.get(group["params"][0], None)
+            if group["params"][0].is_cuda:
+                stored_state = self.optimizer.gpu_adam.state.get(group["params"][0], None)
+
+                assert stored_state is not None, "Unified adam is a stateful optimizer."
+                # Update optimizer states.
+                if "exp_avg" not in stored_state:
+                    stored_state["momentum_buffer"] = torch.cat(
+                        (
+                            stored_state["momentum_buffer"],
+                            torch.zeros_like(extension_tensor),
+                        ),
+                        dim=0,
+                    )
+                else:
+                    stored_state["exp_avg"] = torch.cat(
+                        (stored_state["exp_avg"], torch.zeros_like(extension_tensor)),
+                        dim=0,
+                    )
+                    stored_state["exp_avg_sq"] = torch.cat(
+                        (
+                            stored_state["exp_avg_sq"],
+                            torch.zeros_like(extension_tensor),
+                        ),
+                        dim=0,
+                    )
+
+                del self.optimizer.gpu_adam.state[group["params"][0]]
+                
+                # Update parameters.
+                group["params"][0] = nn.Parameter(
+                    torch.cat(
+                        (group["params"][0], extension_tensor), dim=0
+                    ).requires_grad_(True)
+                )
+                self.optimizer.gpu_adam.state[group["params"][0]] = stored_state
+                optimizable_tensors[group["name"]] = group["params"][0]
+            
+            else:
+                stored_state = self.optimizer.cpu_adam.state.get(group["params"][0], None)
+
+                assert stored_state is not None, "Unified adam is a stateful optimizer."
+                # Update optimizer states.
+                if "exp_avg" not in stored_state:
+                    stored_state["momentum_buffer"] = torch.cat(
+                        (
+                            stored_state["momentum_buffer"],
+                            torch.zeros_like(extension_tensor),
+                        ),
+                        dim=0,
+                    )
+                else:
+                    stored_state["exp_avg"] = torch.cat(
+                        (stored_state["exp_avg"], torch.zeros_like(extension_tensor)),
+                        dim=0,
+                    )
+                    stored_state["exp_avg_sq"] = torch.cat(
+                        (
+                            stored_state["exp_avg_sq"],
+                            torch.zeros_like(extension_tensor),
+                        ),
+                        dim=0,
+                    )
+
+                del self.optimizer.cpu_adam.state[group["params"][0]]
+                
+                # Update parameters.
+                N = group["params"][0].shape[0]
+                N_ext = extension_tensor.shape[0]
+                self.parameters_buffer[N:(N + N_ext)] = extension_tensor
+                group["params"][0] = nn.Parameter(
+                    self.parameters_buffer[:(N + N_ext)].requires_grad_(True)
+                )
+                self.optimizer.cpu_adam.state[group["params"][0]] = stored_state
+                optimizable_tensors[group["name"]] = group["params"][0]
+
+        self.optimizer.state = self.optimizer.gpu_adam.state | self.optimizer.cpu_adam.state
         return optimizable_tensors
 
     def densification_postfix(
@@ -1308,26 +1509,56 @@ class GaussianModel:
         new_send_to_gpui_cnt,
         new_parameters=None,
     ):
-        if self.device == 'cpu' and self.mxw_debug == 'cat':
-            d = {
-                "parameters": new_parameters,
-            }
-            
-            optimizable_tensors = self.cat_tensors_to_optimizer(d)
-            self._parameters = optimizable_tensors["parameters"]
-            dims = [self._xyz.shape[1], self._opacity.shape[1], self._scaling.shape[1], self._rotation.shape[1], self._features_dc.shape[1], self._features_rest.shape[1]]           
-            self._xyz, self._opacity, self._scaling, self._rotation, self._features_dc, self._features_rest = torch.split(self._parameters, dims, dim=1)
+        d = {
+            "xyz": new_xyz,
+            "f_dc": new_features_dc,
+            "f_rest": new_features_rest,
+            "opacity": new_opacities,
+            "scaling": new_scaling,
+            "rotation": new_rotation,
+            "parameters": new_parameters,
+        }
+        if self.args.offload and self.args.gpu_cache == "xyzosr":
+            optimizable_tensors = self.cat_tensors_to_unified_adam(d)
         else:
-            d = {
-                "xyz": new_xyz,
-                "f_dc": new_features_dc,
-                "f_rest": new_features_rest,
-                "opacity": new_opacities,
-                "scaling": new_scaling,
-                "rotation": new_rotation,
-            }
-            
             optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        # optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        
+        if self.args.offload:
+            if self.args.gpu_cache == "no_cache":
+                self._parameters = optimizable_tensors["parameters"]
+                dims = [self._xyz.shape[1], self._opacity.shape[1], self._scaling.shape[1], self._rotation.shape[1], self._features_dc.shape[1], self._features_rest.shape[1]]           
+                self._xyz, self._opacity, self._scaling, self._rotation, self._features_dc, self._features_rest = torch.split(self._parameters, dims, dim=1)
+                
+                assert self._parameters.is_pinned()
+                assert self._xyz.is_pinned()
+                assert self._opacity.is_pinned()
+                assert self._scaling.is_pinned()
+                assert self._rotation.is_pinned()
+                assert self._features_dc.is_pinned()
+                assert self._features_rest.is_pinned()
+                
+            elif self.args.gpu_cache == "xyzosr":
+                self._xyz = optimizable_tensors["xyz"]
+                self._opacity = optimizable_tensors["opacity"]
+                self._scaling = optimizable_tensors["scaling"]
+                self._rotation = optimizable_tensors["rotation"]
+                self._parameters = optimizable_tensors["parameters"]
+                dims = [3, 45]           
+                self._features_dc, self._features_rest = torch.split(self._parameters, dims, dim=1)
+                
+                assert self._xyz.is_cuda
+                assert self._opacity.is_cuda
+                assert self._scaling.is_cuda
+                assert self._rotation.is_cuda
+                assert self._parameters.is_pinned()
+                assert self._features_dc.is_pinned()
+                assert self._features_rest.is_pinned()
+            
+            else:
+                raise ValueError("Invalid gpu cache strategy.")
+            
+        else:
             self._xyz = optimizable_tensors["xyz"]
             self._features_dc = optimizable_tensors["f_dc"]
             self._features_rest = optimizable_tensors["f_rest"]
@@ -1345,16 +1576,6 @@ class GaussianModel:
         self.send_to_gpui_cnt = torch.cat(
             (self.send_to_gpui_cnt, new_send_to_gpui_cnt), dim=0
         )
-        
-        if self.device == 'cpu' and self.mxw_debug == 'fused':
-            assert self._xyz.is_pinned(), "`[after densification] self._xyz` is not in pinned memory"
-            assert self._scaling.is_pinned(), "`[after densification] self._scaling` is not in pinned memory"
-            assert self._rotation.is_pinned(), "`[after densification] self._rotation` is not in pinned memory"
-            assert self._opacity.is_pinned(), "`[after densification] self._opacity` is not in pinned memory"
-            assert self._features_dc.is_pinned(), "`[after densification] self._features_dc` is not in pinned memory"
-            assert self._features_rest.is_pinned(), "`[after densification] self._features_rest` is not in pinned memory"
-        elif self.device == 'cpu' and self.mxw_debug == 'cat':
-            assert self._parameters.is_pinned(), "[after densification] self._parameters` is not in pinned memory"
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -1376,29 +1597,48 @@ class GaussianModel:
         utils.get_log_file().write(
             "Number of split gaussians: {}\n".format(selected_pts_mask.sum().item())
         )
-        if self.device == 'cpu' and self.mxw_debug == 'cat':
-            rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
-            new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[
-                selected_pts_mask
-            ].repeat(N, 1)
-            new_scaling = self.scaling_inverse_activation(
-                self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N)
-            )
-            new_parameters = self._parameters[selected_pts_mask].repeat(N, 1)
-            new_parameters[:, :self._xyz.shape[1]] = new_xyz
-            new_parameters[:, (self._xyz.shape[1] + self._opacity.shape[1]):(self._xyz.shape[1] + self._opacity.shape[1] + self._scaling.shape[1])] = new_scaling
-            new_send_to_gpui_cnt = self.send_to_gpui_cnt[selected_pts_mask].repeat(N, 1)
+        
+        if self.args.offload:
+            selected_pts_mask_cpu = selected_pts_mask.cpu()
+            if self.args.gpu_cache == "no_cache":
+                rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
+                xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[
+                    selected_pts_mask
+                ].repeat(N, 1)
+                new_scaling = self.scaling_inverse_activation(
+                    self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N)
+                )
+                new_parameters = self._parameters[selected_pts_mask_cpu].repeat(N, 1)
+                new_parameters[:, :self._xyz.shape[1]] = xyz
+                new_parameters[:, (self._xyz.shape[1] + self._opacity.shape[1]):(self._xyz.shape[1] + self._opacity.shape[1] + self._scaling.shape[1])] = new_scaling
+                new_send_to_gpui_cnt = self.send_to_gpui_cnt[selected_pts_mask].repeat(N, 1)
+                
+                new_xyz = None
+                new_features_dc = None
+                new_features_rest = None
+                new_opacities = None
+                new_scaling = None
+                new_rotation = None
+                
+            elif self.args.gpu_cache == "xyzosr":
+                rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
+                new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[
+                    selected_pts_mask
+                ].repeat(N, 1)
+                new_scaling = self.scaling_inverse_activation(
+                    self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N)
+                )
+                new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
+                new_opacities = self._opacity[selected_pts_mask].repeat(N, 1)
+                new_parameters = self._parameters[selected_pts_mask_cpu].repeat(N, 1)
+                new_send_to_gpui_cnt = self.send_to_gpui_cnt[selected_pts_mask].repeat(N, 1)
+                
+                new_features_dc = None
+                new_features_rest = None
             
-            self.densification_postfix(
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                new_send_to_gpui_cnt,
-                new_parameters,
-            )
+            else:
+                raise ValueError("Invalid gpu cache strategy.")
+        
         else:
             rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
             new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[
@@ -1410,18 +1650,20 @@ class GaussianModel:
             new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
             new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
             new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
-            new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
+            new_opacities = self._opacity[selected_pts_mask].repeat(N, 1)
             new_send_to_gpui_cnt = self.send_to_gpui_cnt[selected_pts_mask].repeat(N, 1)
+            new_parameters = None
             
-            self.densification_postfix(
-                new_xyz,
-                new_features_dc,
-                new_features_rest,
-                new_opacity,
-                new_scaling,
-                new_rotation,
-                new_send_to_gpui_cnt,
-            )
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            new_send_to_gpui_cnt,
+            new_parameters,
+        )
 
         prune_filter = torch.cat(
             (
@@ -1445,20 +1687,32 @@ class GaussianModel:
         utils.get_log_file().write(
             "Number of cloned gaussians: {}\n".format(selected_pts_mask.sum().item())
         )
-        if self.device == 'cpu' and self.mxw_debug == 'cat':
-            new_parameters = self._parameters[selected_pts_mask]
-            new_send_to_gpui_cnt = self.send_to_gpui_cnt[selected_pts_mask]
+        
+        if self.args.offload:
+            selected_pts_mask_cpu = selected_pts_mask.cpu()
+            if self.args.gpu_cache == "no_cache":
+                new_xyz = None
+                new_features_dc = None
+                new_features_rest = None
+                new_opacities = None
+                new_scaling = None
+                new_rotation = None
+                new_parameters = self._parameters[selected_pts_mask_cpu]
+                new_send_to_gpui_cnt = self.send_to_gpui_cnt[selected_pts_mask]
+                
+            elif self.args.gpu_cache == "xyzosr":
+                new_xyz = self._xyz[selected_pts_mask]
+                new_opacities = self._opacity[selected_pts_mask]
+                new_scaling = self._scaling[selected_pts_mask]
+                new_rotation = self._rotation[selected_pts_mask]
+                new_parameters = self._parameters[selected_pts_mask_cpu]
+                new_send_to_gpui_cnt = self.send_to_gpui_cnt[selected_pts_mask]
+                new_features_dc = None
+                new_features_rest = None
             
-            self.densification_postfix(
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                new_send_to_gpui_cnt,
-                new_parameters,
-            )
+            else:
+                raise ValueError("Invalid gpu cache strategy.")
+            
         else:
             new_xyz = self._xyz[selected_pts_mask]
             new_features_dc = self._features_dc[selected_pts_mask]
@@ -1467,36 +1721,29 @@ class GaussianModel:
             new_scaling = self._scaling[selected_pts_mask]
             new_rotation = self._rotation[selected_pts_mask]
             new_send_to_gpui_cnt = self.send_to_gpui_cnt[selected_pts_mask]
+            new_parameters = None
 
-            self.densification_postfix(
-                new_xyz,
-                new_features_dc,
-                new_features_rest,
-                new_opacities,
-                new_scaling,
-                new_rotation,
-                new_send_to_gpui_cnt,
-            )
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            new_send_to_gpui_cnt,
+            new_parameters,
+        )
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         args = utils.get_args()
-        if not args.gaussians_distribution and utils.DEFAULT_GROUP.size() > 1:
-            torch.distributed.all_reduce(
-                self.max_radii2D, op=dist.ReduceOp.MAX, group=utils.DP_GROUP
-            )
-            torch.distributed.all_reduce(
-                self.xyz_gradient_accum, op=dist.ReduceOp.SUM, group=utils.DP_GROUP
-            )
-            torch.distributed.all_reduce(
-                self.denom, op=dist.ReduceOp.SUM, group=utils.DP_GROUP
-            )
-
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        densification_stats = {}
-        densification_stats["view_space_grad"] = grads.mean().item()
-        densification_stats["view_space_grad_max"] = grads.max().item()
+        # assert False, f"What's inside grad: grad.device={grad.device.type}, grad={grad.data}"
+        
+        # densification_stats = {}
+        # densification_stats["view_space_grad"] = grads.mean().item()
+        # densification_stats["view_space_grad_max"] = grads.max().item()
 
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
@@ -1540,16 +1787,16 @@ class GaussianModel:
         self.denom[send2gpu_visibility_filter] += 1
 
     def gsplat_add_densification_stats_exact_filter(
-        self, viewspace_point_tensor_grad, send2gpu_final_filter_indices_cpu, width, height
+        self, viewspace_point_tensor_grad, send2gpu_final_filter_indices, width, height
     ):  # the :2] is a weird implementation. It is because viewspace_point_tensor is (N, 3) tensor.
         grad = viewspace_point_tensor_grad  # (N, 2)
         # Normalize the gradients to [-1, 1] screen size
         grad[:, 0] *= width * 0.5
         grad[:, 1] *= height * 0.5
-        self.xyz_gradient_accum[send2gpu_final_filter_indices_cpu] += torch.norm(
+        self.xyz_gradient_accum[send2gpu_final_filter_indices] += torch.norm(
             grad, dim=-1, keepdim=True
         )
-        self.denom[send2gpu_final_filter_indices_cpu] += 1
+        self.denom[send2gpu_final_filter_indices] += 1
 
     def group_for_redistribution(self):
         args = utils.get_args()

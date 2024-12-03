@@ -29,7 +29,7 @@ from utils.timer import Timer, End2endTimer
 from tqdm import tqdm
 from utils.image_utils import psnr
 import torch.distributed as dist
-from densification import densification, gsplat_densification
+from densification import densification, gsplat_densification, update_densification_stats_pipelineoffload_xyzosr
 from diff_gaussian_rasterization import (
     send2cpu,
     send2cpu_cat_buffer,
@@ -221,7 +221,7 @@ def pipeline_forward_one_step(
 
     rendered_image = rendered_image.squeeze(0).permute(2, 0, 1).contiguous()
 
-    return rendered_image
+    return rendered_image, batched_means2D, batched_radiis
 
 def pipeline_offload_impl(
     gaussians,
@@ -333,7 +333,7 @@ def pipeline_offload_impl(
         filtered_shs = shs.requires_grad_() # this is a view of the original shs.
 
         # preprocess
-        rendered_image = pipeline_forward_one_step(filtered_opacity_gpu,
+        rendered_image, batched_means2D, batched_radiis = pipeline_forward_one_step(filtered_opacity_gpu,
                                                 filtered_scaling_gpu,
                                                 filtered_rotation_gpu,
                                                 filtered_xyz_gpu,
@@ -376,6 +376,19 @@ def pipeline_offload_impl(
                 # shs.grad = None
 
         torch.cuda.nvtx.range_pop()
+
+        # Update densification state.
+        update_densification_stats_pipelineoffload_xyzosr(
+            scene,
+            gaussians,
+            int(batched_cameras[micro_idx].image_height),
+            int(batched_cameras[micro_idx].image_width),
+            filters[micro_idx],
+            batched_means2D.grad.squeeze(0),
+            batched_radiis.squeeze(0),
+        )
+
+        del batched_means2D, batched_radiis
 
     if args.offload_shs_grad_before_every_microbatch:
         with torch.cuda.stream(comm_stream):
@@ -483,13 +496,15 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
         
     # Preallocate memory for grad
-    if args.offload:
-        if args.gpu_cache == "xyzosr":
-            parameters_grad_buffer = torch.zeros((args.prealloc_capacity, 48), dtype=torch.float32, pin_memory=True)
-        elif args.gpu_cache == "no_cache":
-            parameters_grad_buffer = torch.zeros((args.prealloc_capacity, 59), dtype=torch.float32, pin_memory=True)
-        else:
-            raise Exception("Invalid gpu cache strategy.")
+    # if args.offload:
+    #     if args.gpu_cache == "xyzosr":
+    #         parameters_buffer = torch.empty((args.prealloc_capacity, 48), dtype=torch.float32, pin_memory=True)
+    #         parameters_grad_buffer = torch.zeros((args.prealloc_capacity, 48), dtype=torch.float32, pin_memory=True)
+    #     elif args.gpu_cache == "no_cache":
+    #         parameters_buffer = torch.empty((args.prealloc_capacity, 59), dtype=torch.float32, pin_memory=True)
+    #         parameters_grad_buffer = torch.zeros((args.prealloc_capacity, 59), dtype=torch.float32, pin_memory=True)
+    #     else:
+    #         raise ValueError("Invalid gpu cache strategy.")
 
     # Training Loop
     end2end_timers = End2endTimer(args)
@@ -612,13 +627,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 gaussians,
                 scene,
                 batched_cameras,
-                parameters_grad_buffer,
+                gaussians.parameters_grad_buffer,
                 background,
                 pipe_args
             )
             batched_screenspace_pkg = {}
 
-            gaussians._parameters.grad = parameters_grad_buffer[:N, :]
+            gaussians._parameters.grad = gaussians.parameters_grad_buffer[:N, :]
             
             # Sync losses in the batch
             timers.start("sync_loss_and_log")
@@ -737,7 +752,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         send_shs2cpu_shs_buffer(
                             shs.grad,
                             send2gpu_final_filter_indices,
-                            parameters_grad_buffer[:N, :],
+                            gaussians.parameters_grad_buffer[:N, :],
                             accum=True
                         ) # This kernel blocks the cpu.
                         timers.stop("fused grad transfer")
@@ -747,7 +762,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         del shs
                         
                         timers.start("load from buffer")
-                        gaussians._parameters.grad = parameters_grad_buffer[:N, :]
+                        gaussians._parameters.grad = gaussians.parameters_grad_buffer[:N, :]
                         timers.stop("load from buffer")
                     
                     elif args.gpu_cache == "no_cache":
@@ -769,7 +784,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                             param_dims,
                             param_dims_presum_rshift,
                             col2attr,
-                            parameters_grad_buffer[:N, :],
+                            gaussians.parameters_grad_buffer[:N, :],
                             accum=True
                         ) # This kernel blocks the cpu.
                         timers.stop("fused grad transfer")
@@ -784,7 +799,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         del means3D, opacities, scales, rotations, shs
                         
                         timers.start("load from buffer")
-                        gaussians._parameters.grad = parameters_grad_buffer[:N, :]
+                        gaussians._parameters.grad = gaussians.parameters_grad_buffer[:N, :]
                         timers.stop("load from buffer")
                     
                     else:
@@ -975,7 +990,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             # Densification
             # utils.memory_report("before densification")
             if args.backend == "gsplat":
-                if args.offload and args.bsz > 1:
+                if args.offload:
                     gsplat_densification(
                         iteration, scene, gaussians, batched_screenspace_pkg, offload=args.offload, densify_only=True
                     )
@@ -1076,7 +1091,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 
                 if args.offload:
                     timers.start("zero out grads")
-                    parameters_grad_buffer[:N, :].zero_()
+                    gaussians.parameters_grad_buffer[:N, :].zero_()
                     timers.stop("zero out grads")
                     
 
@@ -1340,21 +1355,43 @@ def training_report(
                         camera.full_proj_transform = camera.full_proj_transform.cuda()
                         
                         if backend == "gsplat":
-                            batched_screenspace_pkg = (
-                                gsplat_distributed_preprocess3dgs_and_all2all_final(
-                                    [camera],
-                                    scene.gaussians,
-                                    pipe_args,
-                                    background,
-                                    batched_strategies=[strategy],
-                                    mode="test",
-                                    offload=offload,
+                            if args.offload and args.gpu_cache == "xyzosr":
+                                batched_screenspace_pkg = (
+                                    gsplat_distributed_preprocess3dgs_and_all2all_offloaded_cacheXYZOSR(
+                                        [camera],
+                                        scene.gaussians,
+                                        pipe_args,
+                                        background,
+                                        batched_strategies=[strategy],
+                                        mode="test",
+                                        offload=args.offload
+                                    )
                                 )
-                            )
-                            images, _ = gsplat_render_final(
-                                batched_screenspace_pkg, [strategy]
-                            )
-                            batched_image.append(images[0])
+                                images, _ = gsplat_render_final(
+                                    batched_screenspace_pkg, [strategy]
+                                )
+                                batched_image.append(images[0])
+                            
+                            elif args.offload and args.gpu_cache == "no_cache":
+                                batched_screenspace_pkg = (
+                                    gsplat_distributed_preprocess3dgs_and_all2all_final(
+                                        [camera],
+                                        scene.gaussians,
+                                        pipe_args,
+                                        background,
+                                        batched_strategies=[strategy],
+                                        mode="test",
+                                        offload=offload,
+                                    )
+                                )
+                                images, _ = gsplat_render_final(
+                                    batched_screenspace_pkg, [strategy]
+                                )
+                                batched_image.append(images[0])
+                            
+                            else:
+                                raise ValueError("Invalid gpu cache strategy.")
+                            
                         else:
                             batched_screenspace_pkg = (
                                 distributed_preprocess3dgs_and_all2all_final(

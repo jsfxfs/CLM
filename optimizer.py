@@ -58,7 +58,9 @@ class UnifiedAdam(torch.optim.Optimizer):
             fp32_optimizer_states=fp32_optimizer_states
         )
         
-        super(UnifiedAdam, self).__init__(params, defaults) 
+        # super(UnifiedAdam, self).__init__(params, defaults)  # -> not root cause of nan bug
+        self.param_groups = self.gpu_adam.param_groups + self.cpu_adam.param_groups
+        self.state = self.gpu_adam.state | self.cpu_adam.state #NOTE: This works but is weird: optimizer.states will be on both host & device
         
         # self.param_groups = self.gpu_adam.param_groups + self.cpu_adam.param_groups
     
@@ -72,6 +74,9 @@ class UnifiedAdam(torch.optim.Optimizer):
     # def __del__(self):
     #     self.cpu_adam.__del__()
     
+    def get_all_states(self):
+        return [self.gpu_adam.state, self.cpu_adam.state]
+    
     def zero_grad(self, set_to_none=False):
         self.gpu_adam.zero_grad(set_to_none)
         self.cpu_adam.zero_grad(set_to_none)
@@ -79,5 +84,6 @@ class UnifiedAdam(torch.optim.Optimizer):
     def step(self, closure=None):
         self.gpu_adam.step()
         self.cpu_adam.step()
+        self.state = self.gpu_adam.state | self.cpu_adam.state
         
         

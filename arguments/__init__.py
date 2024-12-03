@@ -185,7 +185,7 @@ class DistributionParams(ParamGroup):
 
         self.adam_type = "default_adam"  # "default_adam", "cpu_adam"
 
-        self.exact_filter = False
+        self.exact_filter = True
 
         super().__init__(parser, "Distribution Parameters")
 
@@ -206,7 +206,7 @@ class BenchmarkParams(ParamGroup):
 class DebugParams(ParamGroup):
     def __init__(self, parser):
         self.zhx_debug = False  # log debug information that zhx needs.
-        self.mxw_debug = ""
+        self.mxw_debug = "cat"
         self.mem_debug = ""
         self.stop_update_param = (
             False  # stop updating parameters. No optimizer.step() will be called.
