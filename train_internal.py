@@ -29,7 +29,12 @@ from utils.timer import Timer, End2endTimer
 from tqdm import tqdm
 from utils.image_utils import psnr
 import torch.distributed as dist
-from densification import densification, gsplat_densification, update_densification_stats_pipelineoffload_xyzosr
+from densification import (
+    densification, 
+    gsplat_densification, 
+    update_densification_stats_pipelineoffload_xyzosr,
+    update_densification_stats_baseline_accumGrads,
+)
 from diff_gaussian_rasterization import (
     send2cpu,
     send2cpu_cat_buffer,
@@ -409,6 +414,150 @@ def pipeline_offload_impl(
     opacity_gpu_origin.backward(opacity_gpu.grad)
     scaling_gpu_origin.backward(scaling_gpu.grad)
     rotation_gpu_origin.backward(rotation_gpu.grad)
+
+    return losses
+
+def baseline_accumGrads_micro_step(
+    means3D,
+    opacities,
+    scales,
+    rotations,
+    shs,
+    sh_degree,
+    camera,
+    background,
+    mode="train",
+    tile_size=16,
+):
+    # Prepare camera param.
+    image_width = int(camera.image_width)
+    image_height = int(camera.image_height)
+    tanfovx = math.tan(camera.FoVx * 0.5)
+    tanfovy = math.tan(camera.FoVy * 0.5)
+    focal_length_x = image_width / (2 * tanfovx)
+    focal_length_y = image_height / (2 * tanfovy)
+    K = torch.tensor(
+        [
+            [focal_length_x, 0, image_width / 2.0],
+            [0, focal_length_y, image_height / 2.0],
+            [0, 0, 1],
+        ],
+        device="cuda",
+    )
+    viewmat = camera.world_view_transform.transpose(0, 1)
+
+    assert K.shape == (3, 3)
+
+    radiis, means2D, depths, conics, _ = fully_fused_projection(
+        means=means3D,  # (N, 3)
+        covars=None,
+        quats=rotations,
+        scales=scales,
+        viewmats=viewmat.unsqueeze(0),
+        Ks=K.unsqueeze(0),
+        width=image_width,
+        height=image_height,
+        packed=False,
+    )
+
+    if mode == "train":
+        means2D.retain_grad()
+    
+    camtoworld = torch.inverse(viewmat.unsqueeze(0))
+    dirs = means3D[None, :, :] - camtoworld[:, None, :3, 3]
+
+    colors = spherical_harmonics(
+        degrees_to_use=sh_degree,
+        dirs=dirs,
+        coeffs=shs.unsqueeze(0),
+        masks=(radiis > 0)
+    )
+    colors = torch.clamp_min(colors + 0.5, 0.0)
+
+    tile_width = math.ceil(image_width / float(tile_size))
+    tile_height = math.ceil(image_height / float(tile_size))
+
+    _, isect_ids, flatten_ids = isect_tiles(
+        means2d=means2D,
+        radii=radiis,
+        depths=depths,
+        tile_size=tile_size,
+        tile_width=tile_width,
+        tile_height=tile_height,
+        packed=False,
+    )
+    isect_offsets = isect_offset_encode(isect_ids, 1, tile_width, tile_height)
+
+    rendered_image, _ = rasterize_to_pixels(
+        means2d=means2D,
+        conics=conics,
+        colors=colors,
+        opacities=opacities.squeeze(1).unsqueeze(0),
+        image_width=image_width,
+        image_height=image_height,
+        tile_size=tile_size,
+        isect_offsets=isect_offsets,
+        flatten_ids=flatten_ids,
+        backgrounds=background,
+    )
+    rendered_image = rendered_image.squeeze(0).permute(2, 0, 1).contiguous()
+
+    return rendered_image, means2D, radiis
+
+def baseline_accumGrads_impl(
+    gaussians,
+    scene,
+    batched_cameras,
+    background,
+    scaling_modifier=1.0
+):
+    losses = []
+
+    means3D = gaussians.get_xyz
+    opacities_origin = gaussians.get_opacity
+    scales_origin = gaussians.get_scaling * scaling_modifier
+    rotations_origin = gaussians.get_rotation
+    shs_origin = gaussians.get_features  # (N, K, 3)
+    sh_degree = gaussians.active_sh_degree
+
+    opacities = opacities_origin.detach().requires_grad_(True)
+    scales = scales_origin.detach().requires_grad_(True)
+    rotations = rotations_origin.detach().requires_grad_(True)
+    shs = shs_origin.detach().requires_grad_(True)
+
+    for micro_idx, camera in enumerate(batched_cameras):
+
+        rendered_image, means2D, radiis = baseline_accumGrads_micro_step(
+            means3D,
+            opacities,
+            scales,
+            rotations,
+            shs,
+            sh_degree,
+            camera,
+            background,
+        )
+        loss = torch_compiled_loss(rendered_image, camera.original_image)
+        loss.backward()
+        losses.append(loss.detach())
+
+        with torch.no_grad():
+            # Update densification state.
+            update_densification_stats_baseline_accumGrads(
+                scene,
+                gaussians,
+                int(camera.image_height),
+                int(camera.image_width),
+                means2D.grad,
+                radiis,
+            )
+        
+        del loss, rendered_image, means2D, radiis
+    
+    opacities_origin.backward(opacities.grad)
+    scales_origin.backward(scales.grad)
+    rotations_origin.backward(rotations.grad)
+    shs_origin.backward(shs.grad)
 
     return losses
 
@@ -858,7 +1007,35 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     batched_screenspace_pkg = None
                     # batched_image = None #TODO: find a better way to free the gt
                     batched_compute_locally = None
-                                    
+        elif args.accumulate_grads:
+            assert args.backend == "gsplat"
+                
+            losses = baseline_accumGrads_impl(
+                gaussians,
+                scene,
+                batched_cameras,
+                background,
+            )
+            batched_loss = torch.stack(losses)
+            batched_loss_cpu = batched_loss.cpu().numpy()
+            ema_loss_for_log = (
+                batched_loss_cpu.mean()
+                if ema_loss_for_log is None
+                else 0.6 * ema_loss_for_log + 0.4 * batched_loss_cpu.mean()
+            )
+            # Update Epoch Statistics
+            train_dataset.update_losses(batched_loss_cpu)
+            # Logging
+            batched_loss_cpu = [round(loss, 6) for loss in batched_loss_cpu]
+            log_string = "iteration[{},{}) loss: {} image: {}\n".format(
+                iteration,
+                iteration + args.bsz,
+                batched_loss_cpu,
+                [viewpoint_cam.image_name for viewpoint_cam in batched_cameras],
+            )
+            log_file.write(log_string)
+            batched_screenspace_pkg = {}
+                    
         else:
             if args.backend == "gsplat":
                 # utils.memory_report("before preprocessing")
@@ -996,6 +1173,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             # utils.memory_report("before densification")
             if args.backend == "gsplat":
                 if args.offload:
+                    gsplat_densification(
+                        iteration, scene, gaussians, batched_screenspace_pkg, offload=args.offload, densify_only=True
+                    )
+                elif args.accumulate_grads:
                     gsplat_densification(
                         iteration, scene, gaussians, batched_screenspace_pkg, offload=args.offload, densify_only=True
                     )

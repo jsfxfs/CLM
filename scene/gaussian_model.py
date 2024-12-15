@@ -1777,7 +1777,7 @@ class GaussianModel:
     def gsplat_add_densification_stats(
         self, viewspace_point_tensor_grad, send2gpu_visibility_filter, update_filter, width, height
     ):  # the :2] is a weird implementation. It is because viewspace_point_tensor is (N, 3) tensor.
-        grad = viewspace_point_tensor_grad  # (N, 2)
+        grad = viewspace_point_tensor_grad  # (B, N, 2)
         # Normalize the gradients to [-1, 1] screen size
         grad[:, 0] *= width * 0.5
         grad[:, 1] *= height * 0.5

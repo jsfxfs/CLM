@@ -1994,7 +1994,7 @@ def gsplat_render_final(batched_screenspace_pkg, batched_strategies, tile_size=1
             ][cam_id].unsqueeze(0)
             opacities_redistributed = (
                 batched_screenspace_pkg["batched_opacities_redistributed"][cam_id]
-                .squeeze(1)
+                # .squeeze(1)
                 .unsqueeze(0)
             )
             backgrounds = (
@@ -2054,7 +2054,7 @@ def gsplat_render_final(batched_screenspace_pkg, batched_strategies, tile_size=1
                     isect_offsets=isect_offsets,
                     flatten_ids=flatten_ids,
                     backgrounds=backgrounds,
-                    masks=compute_locally.unsqueeze(0),
+                    # masks=compute_locally.unsqueeze(0),
                 )
 
             rendered_image = rendered_image.squeeze(0).permute(2, 0, 1).contiguous()

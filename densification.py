@@ -283,3 +283,48 @@ def update_densification_stats_pipelineoffload_xyzosr(
             utils.check_memory_usage(
                 log_file, args, iteration, gaussians, before_densification_stop=False
             )
+
+def update_densification_stats_baseline_accumGrads(
+    scene,
+    gaussians,
+    image_height,
+    image_width,
+    means2d_grad,
+    radii,
+):
+    iteration = utils.get_cur_iter()
+    args = utils.get_args()
+    timers = utils.get_timers()
+    log_file = utils.get_log_file()
+
+    assert not args.offload
+    # assert radii.shape[0] == send2gpu_final_filter_indices.shape[0], f"radii.shape[0]={radii.shape[0]}, send2gpu_final_filter_indices.shape[0]={send2gpu_final_filter_indices.shape[0]}"
+    # assert send2gpu_final_filter_indices.shape[0] == means2d_grad.shape[0], f"send2gpu_final_filter_indices.shape[0]={send2gpu_final_filter_indices.shape[0]}, means2d_grad.shape[0]={means2d_grad.shape[0]}"
+
+    # Densification
+    if not args.disable_auto_densification and iteration <= args.densify_until_iter:
+        # Keep track of max radii in image-space for pruning
+        # timers.start("densification")
+
+        # timers.start("densification_update_stats")
+        radii = radii.squeeze(0)
+        visibility_filter = radii > 0
+
+        gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+        gaussians.gsplat_add_densification_stats(
+            means2d_grad.squeeze(0),
+            visibility_filter,
+            visibility_filter,
+            image_width,
+            image_height,
+        )           
+        # timers.stop("densification_update_stats")
+
+        # timers.stop("densification")
+    else:
+        if iteration > args.densify_from_iter and utils.check_update_at_this_iter(
+            iteration, args.bsz, args.densification_interval, 0
+        ):
+            utils.check_memory_usage(
+                log_file, args, iteration, gaussians, before_densification_stop=False
+            )
