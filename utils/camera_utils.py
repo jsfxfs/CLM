@@ -92,7 +92,7 @@ def loadCam_raw_from_disk(args, id, cam_info, to_gpu=False):
     ), "All images should have the same size. "
     
     # Get dececoded gt_image from disk
-    with open(os.path.join(args.decode_dataset_path, 'dataset_raw', (cam_info.image_name + '.raw')), 'rb') as raw_file:
+    with open(os.path.join(args.decode_dataset_path, 'dataset_raw', (cam_info.image_name.lstrip('/') + '.raw')), 'rb') as raw_file:
         raw_data = raw_file.read()
     raw_np = np.frombuffer(raw_data, dtype=np.uint8)
     if to_gpu:
@@ -101,6 +101,9 @@ def loadCam_raw_from_disk(args, id, cam_info, to_gpu=False):
     else:
         image_tensor = torch.tensor(raw_np, dtype=torch.uint8).view(orig_h, orig_w, -1).permute(2, 0, 1)
     
+    # assert image_tensor.shape[0] == 3, image_tensor.shape[0]
+    image_tensor = image_tensor[:3, ...].contiguous()
+
     return Camera(
         colmap_id=cam_info.uid,
         R=cam_info.R,
@@ -242,7 +245,9 @@ def predecode_dataset_to_disk(cam_infos, args):
     for id, c in tqdm(enumerate(cam_infos), total=len(cam_infos)):
         img = Image.open(c.image_path)
         raw_data = img.tobytes()
-        with open(os.path.join(args.decode_dataset_path, 'dataset_raw', (c.image_name + '.raw')), 'wb') as raw_file:
+        raw_data_path = os.path.join(args.decode_dataset_path, 'dataset_raw', (c.image_name.lstrip('/') + '.raw'))
+        os.makedirs(os.path.dirname(raw_data_path), exist_ok=True)
+        with open(raw_data_path, 'wb+') as raw_file:
             raw_file.write(raw_data)
 
 def clean_up_disk(args):

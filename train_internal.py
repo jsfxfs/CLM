@@ -806,7 +806,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
     with torch.no_grad():
         if args.torch_dataloader:
-            scene = Scene(args, gaussians, shuffle=False) #HACK: temporarily disable shuffling for reproductability
+            scene = Scene(args, gaussians)
         else:
             scene = Scene(args, gaussians)
         gaussians.training_setup(opt_args)
@@ -831,7 +831,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             dataloader = DataLoader(
                 train_dataset,
                 batch_size=args.bsz,
-                shuffle=True,
+                # shuffle=True,
                 drop_last=True,
                 pin_memory=True,
                 collate_fn=custom_collate_fn
@@ -841,7 +841,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 train_dataset,
                 batch_size=args.bsz,
                 num_workers=args.num_workers,
-                shuffle=True,
+                # shuffle=True,
                 drop_last=True,
                 persistent_workers=True,
                 pin_memory=True,
@@ -984,6 +984,22 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             
         else:
             batched_cameras = train_dataset.get_batched_cameras(args.bsz)
+
+            if args.pipelined_offload:
+                for camera in batched_cameras:
+                    camera.world_view_transform = camera.world_view_transform.cuda()
+                    # camera.projection_matrix = camera.projection_matrix.cuda()
+                    camera.full_proj_transform = camera.full_proj_transform.cuda()
+
+                batched_world_view_transform = []
+                for camera in batched_cameras:
+                    camera.K = camera.create_k_on_gpu()
+                    batched_world_view_transform.append(camera.world_view_transform.transpose(0, 1))
+                batched_world_view_transform = torch.stack(batched_world_view_transform)
+                batched_world_view_transform_inverse = torch.inverse(batched_world_view_transform)
+                batched_world_view_transform_inverse = torch.unbind(batched_world_view_transform_inverse, dim=0)
+                for camera, wvt in zip(batched_cameras, batched_world_view_transform_inverse):
+                    camera.camtoworlds = wvt.unsqueeze(0)
 
         with torch.no_grad():
             # Prepare Workload division strategy

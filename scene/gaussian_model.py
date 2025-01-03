@@ -976,6 +976,7 @@ class GaussianModel:
                     catted_rotation, dtype=torch.float, device="cuda"
                 ).requires_grad_(True)
             )
+            self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -1073,34 +1074,74 @@ class GaussianModel:
             path
         )
 
-        self._xyz = nn.Parameter(
-            torch.tensor(xyz, dtype=torch.float, device=self.device).requires_grad_(True)
-        )
-        self._features_dc = nn.Parameter(
-            torch.tensor(features_dc, dtype=torch.float, device=self.device)
-            .transpose(1, 2)
-            .contiguous()
-            .requires_grad_(True)
-        )
-        self._features_rest = nn.Parameter(
-            torch.tensor(features_extra, dtype=torch.float, device=self.device)
-            .transpose(1, 2)
-            .contiguous()
-            .requires_grad_(True)
-        )
-        self._opacity = nn.Parameter(
-            torch.tensor(opacities, dtype=torch.float, device=self.device).requires_grad_(
-                True
-            )
-        )
-        self._scaling = nn.Parameter(
-            torch.tensor(scales, dtype=torch.float, device=self.device).requires_grad_(True)
-        )
-        self._rotation = nn.Parameter(
-            torch.tensor(rots, dtype=torch.float, device=self.device).requires_grad_(True)
-        )
+        if self.args.offload:
+            self.parameters_buffer = torch.empty(0)
+            self.parameters_grad_buffer = torch.zeros(0)
 
-        self.active_sh_degree = self.max_sh_degree
+            N = xyz.shape[0]
+            if features_dc.ndim == 3:
+                features_dc = np.transpose(features_dc, (0, 2, 1)).reshape(N, -1)
+            if features_extra.ndim == 3:
+                features_extra = np.transpose(features_extra, (0, 2, 1)).reshape(N, -1)
+
+            if self.args.gpu_cache == "xyzosr":
+                self.parameters_buffer = torch.empty((self.args.prealloc_capacity, 48), dtype=torch.float, pin_memory=True)
+                self.parameters_grad_buffer = torch.zeros((self.args.prealloc_capacity, 48), dtype=torch.float, pin_memory=True)
+
+                self.parameters_buffer[:N] = torch.tensor(np.concatenate((features_dc, features_extra), axis=1))
+                self._parameters = nn.Parameter(
+                    self.parameters_buffer[:N].requires_grad_(True)
+                )
+
+                self._xyz = nn.Parameter(
+                    torch.tensor(xyz, dtype=torch.float, device=self.device).requires_grad_(True)
+                )
+                self._opacity = nn.Parameter(
+                    torch.tensor(opacities, dtype=torch.float, device=self.device).requires_grad_(
+                        True
+                    )
+                )
+                self._scaling = nn.Parameter(
+                    torch.tensor(scales, dtype=torch.float, device=self.device).requires_grad_(True)
+                )
+                self._rotation = nn.Parameter(
+                    torch.tensor(rots, dtype=torch.float, device=self.device).requires_grad_(True)
+                )
+
+                self.active_sh_degree = self.max_sh_degree
+            
+            else:
+                raise ValueError("Not implemented yet.")
+        
+        else:
+            self._xyz = nn.Parameter(
+                torch.tensor(xyz, dtype=torch.float, device=self.device).requires_grad_(True)
+            )
+            self._features_dc = nn.Parameter(
+                torch.tensor(features_dc, dtype=torch.float, device=self.device)
+                .transpose(1, 2)
+                .contiguous()
+                .requires_grad_(True)
+            )
+            self._features_rest = nn.Parameter(
+                torch.tensor(features_extra, dtype=torch.float, device=self.device)
+                .transpose(1, 2)
+                .contiguous()
+                .requires_grad_(True)
+            )
+            self._opacity = nn.Parameter(
+                torch.tensor(opacities, dtype=torch.float, device=self.device).requires_grad_(
+                    True
+                )
+            )
+            self._scaling = nn.Parameter(
+                torch.tensor(scales, dtype=torch.float, device=self.device).requires_grad_(True)
+            )
+            self._rotation = nn.Parameter(
+                torch.tensor(rots, dtype=torch.float, device=self.device).requires_grad_(True)
+            )
+
+            self.active_sh_degree = self.max_sh_degree
 
     def load_ply(self, path):
         if os.path.exists(os.path.join(path, "point_cloud.ply")):
