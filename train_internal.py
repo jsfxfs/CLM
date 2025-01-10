@@ -402,6 +402,9 @@ def pipeline_offload_impl(
             update_ls.reverse()
             ordered_cams.reverse()
 
+            batched_cameras = [batched_cameras[i] for i in ordered_cams]
+            filters = [filters[i] for i in ordered_cams]
+
             cat_update_ls = torch.cat(update_ls, dim=0).to(torch.int32)
             # cat_update_ls = torch.cat(update_ls, dim=0)
             update_ls_dim = [len(update) for update in update_ls]
