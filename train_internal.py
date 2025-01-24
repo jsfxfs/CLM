@@ -43,6 +43,7 @@ from diff_gaussian_rasterization import (
     send_shs2gpu_stream,
     send_shs2cpu_grad_buffer_stream,
     send_shs2gpu_stream_retention,
+    send_shs2cpu_grad_buffer_stream_retention,
 )
 import diff_gaussian_rasterization
 import torch.multiprocessing
@@ -484,20 +485,22 @@ def pipeline_offload_impl(
                               parameters_grad):
             torch.cuda.nvtx.range_push(f"cpuadam thread for iter: [{iteration},{iteration+bsz})")
 
+            version = 3 if args.inplace_zero_grad else 2
             parameters.grad = parameters_grad
             if not args.stop_update_param:
                 torch.cuda.nvtx.range_push("cpu_adam.sparse_step()")
                 cpu_adam.batched_sparse_step(batch_size=bsz,
                                              batched_sparse_indices=finish_indices_filters,
                                              signal_tensor_pinned=signal_tensor_pinned,
-                                             version=2,
+                                             version=version,
                                              scale=1.0/bsz
                                         )
                 torch.cuda.nvtx.range_pop()
 
-            torch.cuda.nvtx.range_push("cpu_adam:grad.zero_()")
-            parameters_grad.zero_() # clear the grad buffer so that it can be reused in the next iteration. 
-            torch.cuda.nvtx.range_pop()
+            if version != 3:
+                torch.cuda.nvtx.range_push("cpu_adam:grad.zero_()")
+                parameters_grad.zero_() # clear the grad buffer so that it can be reused in the next iteration. 
+                torch.cuda.nvtx.range_pop()
 
             torch.cuda.nvtx.range_pop()
 
@@ -703,6 +706,10 @@ def pipeline_offload_impl(
         # move shs.grad into shs_grad
         shs_grad.copy_(shs.grad)
 
+        # # free shs
+        # shs.grad = None
+        # del shs
+
         losses.append(loss.detach())
 
         gpu2cpu_event = torch.cuda.Event(enable_timing=True)
@@ -816,7 +823,7 @@ def pipeline_offload_impl(
     torch.cuda.synchronize()
     return losses
 
-def pipeline_offload_intention_impl(
+def pipeline_offload_retention_impl(
     gaussians,
     scene,
     batched_cameras,
@@ -828,6 +835,7 @@ def pipeline_offload_intention_impl(
 ):
     args = utils.get_args()
     iteration = utils.get_cur_iter()
+    assert args.offload_shs_grad_before_every_microbatch, "retention currently requires offload_shs_grad_before_every_microbatc"
 
     # prepare all parameters
     xyz_gpu = gaussians.get_xyz
@@ -859,7 +867,7 @@ def pipeline_offload_intention_impl(
             gs_bitmap[camera_ids, gaussian_ids] = 1
             retent_bitmap = gs_bitmap.clone()
             # the following cumsum is slow (14 ms on 10m rubble)
-            retent_indice = torch.cumsum(retent_bitmap, dim=1, dtype=torch.int64) - 1
+            retent_index = torch.cumsum(retent_bitmap, dim=1, dtype=torch.int64) - 1
             
             torch.cuda.nvtx.range_push("init lists")
             not_touched_ids = torch.nonzero(torch.all(gs_bitmap == 0, dim=0)).flatten()
@@ -887,32 +895,38 @@ def pipeline_offload_intention_impl(
             filters = [filters[i] for i in ordered_cams]
 
             # calculate filters to index retent shs on gpu and shs to load from cpu
-            mask_indicies_from_host = [None]
-            dest_indicies_from_host = [None]
-            mask_indicies_from_retent = [None]
-            dest_indicies_from_retent = [None]
+            host_indices_to_param = [None]
+            param_indices_from_host = [None]
+            rtnt_indices_to_param = [None]
+            param_indices_from_rtnt = [None]
+
+            # for bwd, since we already have a mapping between device param and device retent, 
+            # we just need to add a mapping from device grad to host grad
+            host_indices_from_grad = [None]
+            grad_indices_to_host = [None]
 
             torch.cuda.nvtx.range_push("mask calculation loop")
             for i in range(1, bsz):
                 curr_cam = ordered_cams[i]
                 prev_cam = ordered_cams[i-1]
-                curr_idx = retent_indice[curr_cam]
-                prev_idx = retent_indice[prev_cam]
+                curr_idx = retent_index[curr_cam]
+                prev_idx = retent_index[prev_cam]
 
                 idx_h = torch.nonzero(retent_bitmap[curr_cam] & ~retent_bitmap[prev_cam]).flatten()
-                mask_indicies_from_host.append(idx_h)
-                dest_indicies_from_host.append(torch.gather(curr_idx, dim=0, index=idx_h))
+                host_indices_to_param.append(idx_h)
+                param_indices_from_host.append(torch.gather(curr_idx, dim=0, index=idx_h))
 
                 idx_d = torch.nonzero(retent_bitmap[curr_cam] & retent_bitmap[prev_cam]).flatten() # overlap
-                mask_indicies_from_retent.append(torch.gather(prev_idx, dim=0, index=idx_d))
-                dest_indicies_from_retent.append(torch.gather(curr_idx, dim=0, index=idx_d))
+                rtnt_indices_to_param.append(torch.gather(prev_idx, dim=0, index=idx_d))
+                param_indices_from_rtnt.append(torch.gather(curr_idx, dim=0, index=idx_d))
+
+                idx_g = torch.nonzero(retent_bitmap[prev_cam] & ~retent_bitmap[curr_cam]).flatten()
+                host_indices_from_grad.append(idx_g)
+                grad_indices_to_host.append(torch.gather(prev_idx, dim=0, index=idx_g))
             torch.cuda.nvtx.range_pop()
 
-            ##### Just for debugging
-            # overlap_matrix = torch.matmul(retent_bitmap.to(torch.float32), retent_bitmap.to(torch.float32).T) # bsz x bsz
-            # for i in range(1, bsz):
-            #     assert abs(len(filters_device[i]) - overlap_matrix[ordered_cams[i]][ordered_cams[i-1]]) < 0.001, f"{len(filters_device[i])}, {overlap_matrix[ordered_cams[i]][ordered_cams[i-1]]}"
-            #     assert len(filters_host[i]) + len(filters_device[i]) == len(filters[i]), f"{len(filters_host[i])}, {len(filters_device[i])}, {len(filters[i])}"
+            rtnt_indices_from_grad = param_indices_from_rtnt
+            grad_indices_to_rtnt = rtnt_indices_to_param
 
             torch.cuda.nvtx.range_push("transfer cpuadam update list to cpu")
             cat_update_ls = torch.cat(update_ls, dim=0).to(torch.int32)
@@ -934,71 +948,172 @@ def pipeline_offload_intention_impl(
         
     if args.overlap_cpuadam:
         # Define python thread for computing cpuadam
-        def cpuadam_thread(bsz,
-                           n_gaussians,
-                           microbatch_gradient_send_back_events,
-                           thread_sync_signal_events,
+        def cpuadam_thread_v0(bsz,
+                              n_gaussians,
+                              microbatch_gradient_send_back_events,
+                              thread_sync_signal_events,
+                              finish_indices_filters,
+                              cpu_adam,
+                              parameters,
+                              parameters_grad):
+            torch.cuda.nvtx.range_push(f"cpuadam thread for iter: [{iteration},{iteration+bsz})")
+            parameters.grad = parameters_grad
+
+            cpu_adam.sparse_adam_inc_step() # this is related to lr. 
+            if not args.stop_update_param:
+                torch.cuda.nvtx.range_push("cpu_adam.sparse_step()")
+                cpu_adam.sparse_step(sparse_indices=finish_indices_filters[0], version=2, scale=1.0/bsz)
+                torch.cuda.nvtx.range_pop()
+
+            for i in range(0, bsz):
+                torch.cuda.nvtx.range_push(f"cpuadam microbatch: {i} - [{iteration},{iteration+bsz})")
+                
+                thread_sync_signal_events[i].wait() # wait for the signal of finishing the i-th microbatch.
+
+                finish_event = microbatch_gradient_send_back_events[i] # event of finishing i-th micro batch.
+                finish_event.synchronize() # synchronize with the gpu event on computation stream.
+
+                finish_indices_filter = finish_indices_filters[i+1] # torch int32 array on cpu
+                if not args.stop_update_param and finish_indices_filter.shape[0] > 0: # the finish filter should not be empty
+                    cpu_adam.sparse_step(sparse_indices=finish_indices_filter, version=2, scale=1.0/bsz)
+                
+                torch.cuda.nvtx.range_pop()
+
+            parameters_grad.zero_() # clear the grad buffer so that it can be reused in the next iteration. 
+            torch.cuda.nvtx.range_pop()
+
+        def cpuadam_thread_v1(bsz,
+                              cpu_adam,
+                              parameters,
+                              parameters_grad):
+            parameters.grad = parameters_grad / bsz
+            cpu_adam.step()
+            parameters_grad.zero_() # clear the grad buffer so that it can be reused in the next iteration. 
+
+        def cpuadam_thread_v2(bsz,
                            finish_indices_filters,
                            cpu_adam,
                            parameters,
                            parameters_grad):
+            # parameters.grad = parameters_grad / bsz
+            parameters.grad = parameters_grad
+            cpu_adam.sparse_adam_inc_step()
+            for filter in finish_indices_filters:
+                cpu_adam.sparse_step(sparse_indices=filter, version=1, scale=1.0/bsz)
+            parameters_grad.zero_() # clear the grad buffer so that it can be reused in the next iteration. 
 
-            if overlap_cpuadam_version == 0:
-                torch.cuda.nvtx.range_push(f"cpuadam thread for iter: [{iteration},{iteration+bsz})")
-                parameters.grad = parameters_grad
+        def cpuadam_thread_v3(bsz,
+                              n_gaussians,
+                              signal_tensor_pinned,
+                              finish_indices_filters,
+                              cpu_adam,
+                              parameters,
+                              parameters_grad):
+            torch.cuda.nvtx.range_push(f"cpuadam thread for iter: [{iteration},{iteration+bsz})")
 
-                cpu_adam.sparse_adam_inc_step() # this is related to lr. 
-                if not args.stop_update_param:
-                    torch.cuda.nvtx.range_push("cpu_adam.sparse_step()")
-                    cpu_adam.sparse_step(sparse_indices=finish_indices_filters[0], version=2, scale=1.0/bsz)
-                    torch.cuda.nvtx.range_pop()
+            version = 3 if args.inplace_zero_grad else 2
+            parameters.grad = parameters_grad
+            if not args.stop_update_param:
+                torch.cuda.nvtx.range_push("cpu_adam.sparse_step()")
+                cpu_adam.batched_sparse_step(batch_size=bsz,
+                                             batched_sparse_indices=finish_indices_filters,
+                                             signal_tensor_pinned=signal_tensor_pinned,
+                                             version=version,
+                                             scale=1.0/bsz
+                                        )
+                torch.cuda.nvtx.range_pop()
 
-                for i in range(0, bsz):
-                    torch.cuda.nvtx.range_push(f"cpuadam microbatch: {i} - [{iteration},{iteration+bsz})")
-                    
-                    thread_sync_signal_events[i].wait() # wait for the signal of finishing the i-th microbatch.
-
-                    finish_event = microbatch_gradient_send_back_events[i] # event of finishing i-th micro batch.
-                    finish_event.synchronize() # synchronize with the gpu event on computation stream.
-
-                    finish_indices_filter = finish_indices_filters[i+1] # torch int32 array on cpu
-                    if not args.stop_update_param and finish_indices_filter.shape[0] > 0: # the finish filter should not be empty
-                        cpu_adam.sparse_step(sparse_indices=finish_indices_filter, version=2, scale=1.0/bsz)
-                    
-                    torch.cuda.nvtx.range_pop()
-
+            if version != 3:
+                torch.cuda.nvtx.range_push("cpu_adam:grad.zero_()")
                 parameters_grad.zero_() # clear the grad buffer so that it can be reused in the next iteration. 
                 torch.cuda.nvtx.range_pop()
-            elif overlap_cpuadam_version == 1:
-                parameters.grad = parameters_grad / bsz
-                cpu_adam.step()
-                parameters_grad.zero_() # clear the grad buffer so that it can be reused in the next iteration. 
-            elif overlap_cpuadam_version == 2:
-                parameters.grad = parameters_grad / bsz
-                cpu_adam.sparse_adam_inc_step()
-                for filter in finish_indices_filters:
-                    cpu_adam.sparse_step(sparse_indices=filter, version=1, scale=1.0/bsz)
-                parameters_grad.zero_() # clear the grad buffer so that it can be reused in the next iteration. 
-            else:
-                raise ValueError("Invalid version number for cpuadam_thread.")
+
+            torch.cuda.nvtx.range_pop()
+
+        def cpuadam_thread_v4(bsz,
+                              microbatch_gradient_send_back_events,
+                              thread_sync_signal_events,
+                              signal_tensor_pinned):
+            torch.cuda.nvtx.range_push(f"cpuadam thread for iter: [{iteration},{iteration+bsz})")
+            for i in range(0, bsz):
+                torch.cuda.nvtx.range_push(f"cpuadam microbatch: {i} - [{iteration},{iteration+bsz})")
+                
+                thread_sync_signal_events[i].wait() # wait for the signal of finishing the i-th microbatch.
+
+                finish_event = microbatch_gradient_send_back_events[i] # event of finishing i-th micro batch.
+                finish_event.synchronize() # synchronize with the gpu event on computation stream.
+
+                signal_tensor_pinned[i] = 1 # set signal to 1 to notify gradients have been sent back to cpu
+
+                torch.cuda.nvtx.range_pop()
 
         # Create thread for cpuadam
-        thread_sync_signal_events = [threading.Event() for _ in range(bsz)]
-        main_thread_sync_signal_idx = 0
-        microbatch_gradient_send_back_events = [
-            torch.cuda.Event() for _ in range(bsz)
-        ]
-        cpuadam_worker = threading.Thread(target=cpuadam_thread, args=(bsz,
-                                                                    n_gaussians,
-                                                                    microbatch_gradient_send_back_events,
-                                                                    thread_sync_signal_events,
-                                                                    finish_indices_filters,
-                                                                    gaussians.optimizer.cpu_adam,
-                                                                    gaussians._parameters,
-                                                                    parameters_grad_buffer[:n_gaussians, :],
-                                                                    ))
         if overlap_cpuadam_version == 0:
+            thread_sync_signal_events = [threading.Event() for _ in range(bsz)]
+            main_thread_sync_signal_idx = 0
+            microbatch_gradient_send_back_events = [
+                torch.cuda.Event() for _ in range(bsz)
+            ]
+            cpuadam_worker = threading.Thread(target=cpuadam_thread_v0, args=(bsz,
+                                                                        n_gaussians,
+                                                                        microbatch_gradient_send_back_events,
+                                                                        thread_sync_signal_events,
+                                                                        finish_indices_filters,
+                                                                        gaussians.optimizer.cpu_adam,
+                                                                        gaussians._parameters,
+                                                                        parameters_grad_buffer[:n_gaussians, :],
+                                                                        ))
             cpuadam_worker.start()
+        elif overlap_cpuadam_version == 1:
+            cpuadam_worker = threading.Thread(target=cpuadam_thread_v1, args=(bsz,
+                                                                              gaussians.optimizer.cpu_adam,
+                                                                              gaussians._parameters,
+                                                                              parameters_grad_buffer[:n_gaussians, :],
+                                                                              ))
+        elif overlap_cpuadam_version == 2:
+            cpuadam_worker = threading.Thread(target=cpuadam_thread_v2, args=(bsz,
+                                                                              finish_indices_filters,
+                                                                              gaussians.optimizer.cpu_adam,
+                                                                              gaussians._parameters,
+                                                                              parameters_grad_buffer[:n_gaussians, :],
+                                                                              ))
+        elif overlap_cpuadam_version == 3:
+            signal_tensor_pinned = torch.zeros(bsz, dtype=torch.int32, device="cpu", pin_memory=True)
+            microbatch_idx = 0
+            cpuadam_worker = threading.Thread(target=cpuadam_thread_v3, args=(bsz,
+                                                                              n_gaussians,
+                                                                              signal_tensor_pinned,
+                                                                              finish_indices_filters,
+                                                                              gaussians.optimizer.cpu_adam,
+                                                                              gaussians._parameters,
+                                                                              parameters_grad_buffer[:n_gaussians, :],
+                                                                              ))
+            cpuadam_worker.start()
+        elif overlap_cpuadam_version == 4:
+            signal_tensor_pinned = torch.zeros(bsz, dtype=torch.int32, device="cpu", pin_memory=True)
+            microbatch_idx = 0
+            cpuadam_worker = threading.Thread(target=cpuadam_thread_v3, args=(bsz,
+                                                                              n_gaussians,
+                                                                              signal_tensor_pinned,
+                                                                              finish_indices_filters,
+                                                                              gaussians.optimizer.cpu_adam,
+                                                                              gaussians._parameters,
+                                                                              parameters_grad_buffer[:n_gaussians, :],
+                                                                              ))
+            cpuadam_worker.start()
+            
+            thread_sync_signal_events = [threading.Event() for _ in range(bsz)]
+            main_thread_sync_signal_idx = 0
+            microbatch_gradient_send_back_events = [
+                torch.cuda.Event() for _ in range(bsz)
+            ]
+            cpuadam_synchronization_worer = threading.Thread(target=cpuadam_thread_v4, args=(bsz,
+                                                                                             microbatch_gradient_send_back_events,
+                                                                                             thread_sync_signal_events,
+                                                                                             signal_tensor_pinned))
+            cpuadam_synchronization_worer.start()
+        else:
+            raise ValueError("Invalid overlap_cpuadam_version.")            
 
     # accumulate gradients at opacity_gpu, scaling_gpu, rotation_gpu since they are computed afer the activation functions.
     # no need for xyz since it does not have activation function.
@@ -1050,10 +1165,10 @@ def pipeline_offload_intention_impl(
                     shs_next,
                     gaussians._parameters,
                     shs_retent,
-                    mask_indicies_from_host[micro_idx + 1],
-                    mask_indicies_from_retent[micro_idx + 1],
-                    dest_indicies_from_host[micro_idx + 1],
-                    dest_indicies_from_retent[micro_idx + 1],
+                    host_indices_to_param[micro_idx + 1],
+                    rtnt_indices_to_param[micro_idx + 1],
+                    param_indices_from_host[micro_idx + 1],
+                    param_indices_from_rtnt[micro_idx + 1],
                     grid_size, block_size
                 )
                 shs_next.requires_grad_(True)
@@ -1064,25 +1179,40 @@ def pipeline_offload_intention_impl(
 
         with torch.cuda.stream(comm_stream):
             last_microbatch_shs_grad = shs_grad
-            shs_grad = torch.empty_like(shs)
+            # shs_grad = torch.empty_like(shs)
+            shs_grad = torch.zeros_like(shs)
+            shs_grad_init_event = torch.cuda.Event()
+            shs_grad_init_event.record(comm_stream)
+
 
         if args.offload_shs_grad_before_every_microbatch and micro_idx > 0:
             with torch.cuda.stream(comm_stream):
                 gpu2cpu_event.wait(comm_stream)
                 # sync event of default_stream with comm_stream
                 # timers.start("fused grad transfer") # rewrite the timer function.
-                send_shs2cpu_grad_buffer_stream(
+
+                send_shs2cpu_grad_buffer_stream_retention(
                     last_microbatch_shs_grad,
                     parameters_grad_buffer[:N, :],
-                    filters[micro_idx-1],
+                    shs_grad,
+                    host_indices_from_grad[micro_idx],
+                    rtnt_indices_from_grad[micro_idx],
+                    grad_indices_to_host[micro_idx],
+                    grad_indices_to_rtnt[micro_idx],
                     True,
                     grid_size, block_size
                 )
+                
                 if args.overlap_cpuadam:
-                    event = microbatch_gradient_send_back_events[main_thread_sync_signal_idx]
-                    event.record()
-                    thread_sync_signal_events[main_thread_sync_signal_idx].set()
-                    main_thread_sync_signal_idx += 1
+                    if args.overlap_cpuadam_version in [0, 4]:
+                        event = microbatch_gradient_send_back_events[main_thread_sync_signal_idx]
+                        event.record()
+                        thread_sync_signal_events[main_thread_sync_signal_idx].set()
+                        main_thread_sync_signal_idx += 1
+                    elif args.overlap_cpuadam_version == 3:
+                        # set signal to pinned memory to notify gradients have been sent back to cpu
+                        diff_gaussian_rasterization._C.set_signal(signal_tensor_pinned, microbatch_idx, 1)
+                        microbatch_idx += 1
 
         torch.cuda.nvtx.range_push("forward_pass")
         this_filter = filters[micro_idx]
@@ -1112,7 +1242,13 @@ def pipeline_offload_intention_impl(
         loss.backward()
         torch.cuda.nvtx.range_pop()
         # move shs.grad into shs_grad
-        shs_grad.copy_(shs.grad)
+        shs_grad_init_event.wait(default_stream) # wait for `shs_grad` to finish init`
+        # shs_grad.copy_(shs.grad)
+        shs_grad.add_(shs.grad)
+
+        ## free shs
+        # shs.grad = None
+        # del shs
 
         losses.append(loss.detach())
 
@@ -1132,10 +1268,15 @@ def pipeline_offload_intention_impl(
                     grid_size, block_size,
                 )
                 if args.overlap_cpuadam:
-                    event = microbatch_gradient_send_back_events[main_thread_sync_signal_idx]
-                    event.record()
-                    thread_sync_signal_events[main_thread_sync_signal_idx].set()
-                    main_thread_sync_signal_idx += 1
+                    if args.overlap_cpuadam_version in [0, 4]:
+                        event = microbatch_gradient_send_back_events[main_thread_sync_signal_idx]
+                        event.record()
+                        thread_sync_signal_events[main_thread_sync_signal_idx].set()
+                        main_thread_sync_signal_idx += 1
+                    elif args.overlap_cpuadam_version == 3:
+                        # set signal to pinned memory to notify gradients have been sent back to cpu
+                        diff_gaussian_rasterization._C.set_signal(signal_tensor_pinned, microbatch_idx, 1)
+                        microbatch_idx += 1
 
                 # timers.stop("fused grad transfer")
 
@@ -1170,19 +1311,28 @@ def pipeline_offload_intention_impl(
                 True,
                 16, 256,
             )
+
             if args.overlap_cpuadam:
-                event = microbatch_gradient_send_back_events[main_thread_sync_signal_idx]
-                event.record()
-                thread_sync_signal_events[main_thread_sync_signal_idx].set()
-                main_thread_sync_signal_idx += 1
+                if args.overlap_cpuadam_version in [0, 4]:
+                    event = microbatch_gradient_send_back_events[main_thread_sync_signal_idx]
+                    event.record()
+                    thread_sync_signal_events[main_thread_sync_signal_idx].set()
+                    main_thread_sync_signal_idx += 1
+                elif args.overlap_cpuadam_version == 3:
+                    # set signal to pinned memory to notify gradients have been sent back to cpu
+                    diff_gaussian_rasterization._C.set_signal(signal_tensor_pinned, microbatch_idx, 1)
+                    microbatch_idx += 1
 
     opacity_gpu_origin.backward(opacity_gpu.grad)
     scaling_gpu_origin.backward(scaling_gpu.grad)
     rotation_gpu_origin.backward(rotation_gpu.grad)
 
     if args.overlap_cpuadam:
-        assert main_thread_sync_signal_idx == bsz, "main_thread_sync_signal_idx should be equal to bsz."
-        if overlap_cpuadam_version != 0:
+        if args.overlap_cpuadam_version in [0, 4]:
+            assert main_thread_sync_signal_idx == bsz, "main_thread_sync_signal_idx should be equal to bsz."
+        if overlap_cpuadam_version == 3:
+            assert microbatch_idx == bsz, "microbatch_idx should be equal to bsz."
+        if overlap_cpuadam_version not in [0, 3]:
             cpuadam_worker.start()
         assert args.lr_scale_mode == "sqrt", "Overlap CPUAdam only supports sqrt lr scaling"
         assert args.gpu_cache == "xyzosr", "Overlap CPUAdam only supports xyzosr cache"
@@ -1595,7 +1745,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             N = gaussians._xyz.shape[0]
             
             if args.retention:
-                losses = pipeline_offload_intention_impl(
+                losses = pipeline_offload_retention_impl(
                     gaussians,
                     scene,
                     batched_cameras,
@@ -2145,6 +2295,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         #     json.dump(gc_stats, file, indent=4)
 
     # Finish training
+    del comm_stream
     if opt_args.iterations not in args.save_iterations:
         end2end_timers.print_time(log_file, opt_args.iterations)
     log_file.write(
