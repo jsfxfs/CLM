@@ -2726,7 +2726,7 @@ def pipeline_offload_retention_optimized_v4_impl(
 
             batched_cameras = [batched_cameras[i] for i in ordered_cams]
             filters = [filters[i] for i in ordered_cams]
-            sparsity = [len(filters[i]) / float(n_gaussians) for i in ordered_cams]
+            sparsity = [len(filters[i]) / float(n_gaussians) for i in range(bsz)]
 
             torch.cuda.nvtx.range_push("precompute sums")
             for i in range(bsz-1):
