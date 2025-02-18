@@ -237,6 +237,7 @@ class DebugParams(ParamGroup):
         self.order_calculation_version = 1
         self.retention = 0
         self.log_sampled_filters = 0
+        self.subsample_ratio = 1.0
 
         super().__init__(parser, "Debug Parameters")
 

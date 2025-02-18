@@ -240,7 +240,7 @@ class Scene:
             self.gaussians.load_ply(args.load_ply_path)
         else:
             if args.offload:
-                self.gaussians.create_from_pcd_offloaded(scene_info.point_cloud, self.cameras_extent)
+                self.gaussians.create_from_pcd_offloaded(scene_info.point_cloud, self.cameras_extent, args.subsample_ratio)
             else:
                 self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
