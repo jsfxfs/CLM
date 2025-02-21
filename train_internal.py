@@ -3089,6 +3089,56 @@ def pipeline_offload_retention_optimized_v4_impl(
     torch.cuda.synchronize()
     return losses, ordered_cams, sparsity
 
+def offload_eval_one_cam(
+    camera,
+    gaussians,
+    background,
+    scene
+):
+    # Prepare parameters.
+    xyz_gpu = gaussians.get_xyz
+    opacity_gpu_origin = gaussians.get_opacity
+    scaling_gpu_origin = gaussians.get_scaling
+    rotation_gpu_origin = gaussians.get_rotation
+
+    filters, _, _ = calculate_filters(
+        [camera],
+        xyz_gpu,
+        opacity_gpu_origin,
+        scaling_gpu_origin,
+        rotation_gpu_origin
+    )
+
+    del opacity_gpu_origin, scaling_gpu_origin, rotation_gpu_origin
+    this_filter = filters[0]
+
+    filtered_xyz_gpu = torch.gather(xyz_gpu, 0, this_filter.reshape(-1, 1).expand(-1, 3))
+    filtered_opacity_gpu = torch.gather(gaussians._opacity, 0, this_filter.reshape(-1, 1))
+    filtered_scaling_gpu = torch.gather(gaussians._scaling, 0, this_filter.reshape(-1, 1).expand(-1, 3))
+    filtered_rotation_gpu = torch.gather(gaussians._rotation, 0, this_filter.reshape(-1, 1).expand(-1, 4))
+    
+    filtered_opacity_gpu = gaussians.opacity_activation(filtered_opacity_gpu)
+    filtered_scaling_gpu = gaussians.scaling_activation(filtered_scaling_gpu)
+    filtered_rotation_gpu = gaussians.rotation_activation(filtered_rotation_gpu)
+
+    filtered_shs_gpu = torch.gather(gaussians._features, 0, this_filter.reshape(-1, 1).expand(-1, 48)).to("cuda")
+
+    # Do rendering.
+    rendered_image, _, _ = pipeline_forward_one_step(
+        filtered_opacity_gpu=filtered_opacity_gpu,
+        filtered_scaling_gpu=filtered_scaling_gpu,
+        filtered_rotation_gpu=filtered_rotation_gpu,
+        filtered_xyz_gpu=filtered_xyz_gpu,
+        filtered_shs=filtered_shs_gpu,
+        camera=camera,
+        scene=scene,
+        gaussians=gaussians,
+        background=background,
+        pipe_args=None
+    )
+
+    return rendered_image
+
 def baseline_accumGrads_micro_step(
     means3D,
     opacities,
@@ -4138,48 +4188,17 @@ def training_report(
                         #FIXME: quick workaround for verifying the correctness
                         camera.world_view_transform = camera.world_view_transform.cuda()
                         camera.full_proj_transform = camera.full_proj_transform.cuda()
-                        
+
                         if args.offload:
-                            if args.gpu_cache == "xyzosr":
-                                batched_screenspace_pkg = (
-                                    gsplat_distributed_preprocess3dgs_and_all2all_offloaded_cacheXYZOSR(
-                                        [camera],
-                                        scene.gaussians,
-                                        pipe_args,
-                                        background,
-                                        batched_strategies=[strategy],
-                                        mode="test",
-                                        offload=args.offload,
-                                    )
-                                )
-                                images, _ = gsplat_render_final(
-                                    batched_screenspace_pkg, [strategy]
-                                )
-                                
-                                batched_image.append(images[0])
-                                del batched_screenspace_pkg         
-                            
-                            elif args.gpu_cache == "no_cache":
-                                batched_screenspace_pkg = (
-                                    gsplat_distributed_preprocess3dgs_and_all2all_final(
-                                        [camera],
-                                        scene.gaussians,
-                                        pipe_args,
-                                        background,
-                                        batched_strategies=[strategy],
-                                        mode="test",
-                                        offload=args.offload,
-                                    )
-                                )
-                                images, _ = gsplat_render_final(
-                                    batched_screenspace_pkg, [strategy]
-                                )
-                                
-                                batched_image.append(images[0])
-                                del batched_screenspace_pkg
-                            
-                            else:
-                                raise Exception("Invalid gpu cache strategy.")
+                            assert args.gpu_cache == "xyzosr"
+                            assert args.backend == "gsplat"
+                            rendered_image = offload_eval_one_cam(
+                                camera=camera,
+                                gaussians=scene.gaussians,
+                                background=background,
+                                scene=scene
+                            )
+                            batched_image.append(rendered_image)
                             
                         else:
                             if args.backend == "gsplat":
