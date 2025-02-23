@@ -693,6 +693,97 @@ class GaussianModel:
         for i in range(self._rotation.shape[1]):
             l.append("rot_{}".format(i))
         return l
+    
+    def save_tensors(
+        self, parent_path
+    ):
+        args = utils.get_args()
+        assert args.offload, "Only implemented for offloading."
+
+        mkdir_p(parent_path)
+
+        torch.save(self._xyz, os.path.join(parent_path, "xyz.pt"))
+        torch.save(self._opacity, os.path.join(parent_path, "opacity.pt"))
+        torch.save(self._scaling, os.path.join(parent_path, "scaling.pt"))
+        torch.save(self._rotation, os.path.join(parent_path, "rotation.pt"))
+        torch.save(self._parameters, os.path.join(parent_path, "parameters.pt"))
+        
+    def save_sub_plys(
+        self, path, n_split, split_size
+    ):
+        args = utils.get_args()
+        assert args.offload, "Only implemented for offloading."
+        _xyz = _features_dc = _features_rest = _opacity = _scaling = _rotation = None
+        utils.log_cpu_memory_usage("start save_ply")
+        _xyz = self._xyz
+        _features_dc = self._features_dc
+        _features_rest = self._features_rest
+        _opacity = self._opacity
+        _scaling = self._scaling
+        _rotation = self._rotation
+
+        for i in range(n_split):
+            assert path.endswith(".ply")
+            this_path = (
+                path[:-4]
+                + "_rk"
+                + str(i)
+                + "_ws"
+                + str(n_split)
+                + ".ply"
+            )
+            mkdir_p(os.path.dirname(this_path))
+
+            start = i * split_size
+            end = min((i + 1) * split_size, _xyz.shape[0])
+
+            xyz = _xyz.detach()[start:end].cpu().numpy()
+            normals = np.zeros_like(xyz)
+            f_dc = (
+                _features_dc.detach()[start:end]
+                .contiguous()
+                .view(-1, 1, 3)
+                .transpose(1, 2)
+                .flatten(start_dim=1)
+                .contiguous()
+                .cpu()
+                .numpy()
+            )
+            f_rest = (
+                _features_rest.detach()[start:end]
+                .contiguous()
+                .view(-1, 15, 3)
+                .transpose(1, 2)
+                .flatten(start_dim=1)
+                .contiguous()
+                .cpu()
+                .numpy()
+            )
+            opacities = _opacity.detach()[start:end].cpu().numpy()
+            scale = _scaling.detach()[start:end].cpu().numpy()
+            rotation = _rotation.detach()[start:end].cpu().numpy()
+
+            utils.log_cpu_memory_usage(f"[{i/n_split}] after change gpu tensor to cpu numpy")
+
+            dtype_full = [
+                (attribute, "f4") for attribute in self.construct_list_of_attributes()
+            ]
+
+            elements = np.empty(split_size, dtype=dtype_full)
+            attributes = np.concatenate(
+                (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
+            )
+            del xyz, normals, f_dc, f_rest, opacities, scale, rotation
+            elements[:] = list(map(tuple, attributes))
+            el = PlyElement.describe(elements, "vertex")
+
+            utils.log_cpu_memory_usage(
+                f"[{i/n_split}] after change numpy to plyelement before writing ply file"
+            )
+            PlyData([el]).write(this_path)
+               
+        utils.log_cpu_memory_usage("finish write ply file")
+        # remark: max_radii2D, xyz_gradient_accum and denom are not saved here; they are save elsewhere.
 
     def save_ply(
         self, path

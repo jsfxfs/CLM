@@ -19,6 +19,7 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON, loadCam, predecode_dataset_to_disk, clean_up_disk, loadCam_raw_from_disk
 import utils.general_utils as utils
+import psutil
 
 
 class Scene:
@@ -257,11 +258,30 @@ class Scene:
         utils.check_initial_gpu_memory_usage("after initializing point cloud")
         utils.log_cpu_memory_usage("after loading initial 3dgs points")
 
+    def save_tensors(self, iteration):
+        parent_path = os.path.join(
+            self.model_path, f"saved_tensors/iteration_{iteration}"
+        )
+        self.gaussians.save_tensors(parent_path)
+    
     def save(self, iteration):
         point_cloud_path = os.path.join(
             self.model_path, "point_cloud/iteration_{}".format(iteration)
         )
-        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        avail_ram_bytes = psutil.virtual_memory().available
+        N = self.gaussians._xyz.shape[0]
+        required_bytes = 16 * N * 59 * 4
+
+        # Check if the available ram can fit all attributes for cat and map with 20% redundency.
+        if avail_ram_bytes * 0.8 > required_bytes:
+            # Save in one ply file.
+            self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        else:
+            # Save in multiple sub files.
+            n_split = int((required_bytes + avail_ram_bytes * 0.8 - 1) // (avail_ram_bytes * 0.8))
+            split_size = (N + n_split - 1) // n_split
+            utils.print_rank_0(f"Requires {required_bytes / 1024 / 1024 / 1024:.3f} GB RAM for saving. Avail {avail_ram_bytes / 1024 / 1024 / 1024:.3f} GB. Split: {N} -> {n_split} x {split_size}")
+            self.gaussians.save_sub_plys(os.path.join(point_cloud_path, "point_cloud.ply"), n_split, split_size)   
 
     def getTrainCameras(self):
         return self.train_cameras

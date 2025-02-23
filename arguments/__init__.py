@@ -230,6 +230,7 @@ class DebugParams(ParamGroup):
         self.drop_duplicate_gaussians_coeff = 1.0
         self.do_not_save = False # Do not save model
         self.reset_each_iter = False # Reset max memory for  each iteration
+        self.save_tensors = False # Save model parameters as .pt file
 
         self.manual_gc = False
         self.offload_shs_grad_before_every_microbatch = False

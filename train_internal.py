@@ -4609,7 +4609,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 if not args.do_not_save:
                     utils.print_rank_0("\n[ITER {}] Saving Gaussians".format(iteration))
                     log_file.write("[ITER {}] Saving Gaussians\n".format(iteration))
-                    scene.save(iteration)
+                    if args.save_tensors:
+                        utils.print_rank_0("NOTE: Saving model as .pt files instead of .ply file.")
+                        scene.save_tensors(iteration)
+                    else:
+                        scene.save(iteration)
 
                     if args.save_strategy_history:
                         with open(
