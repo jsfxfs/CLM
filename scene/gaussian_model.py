@@ -709,7 +709,6 @@ class GaussianModel:
         self, parent_path
     ):
         args = utils.get_args()
-        assert args.offload, "Only implemented for offloading."
 
         mkdir_p(parent_path)
 
