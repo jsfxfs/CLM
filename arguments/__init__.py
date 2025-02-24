@@ -241,6 +241,7 @@ class DebugParams(ParamGroup):
         self.retention = 0
         self.log_sampled_filters = 0
         self.subsample_ratio = 1.0
+        self.reinit_ply = False
 
         super().__init__(parser, "Debug Parameters")
 

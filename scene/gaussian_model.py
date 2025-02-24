@@ -966,6 +966,7 @@ class GaussianModel:
         self.prune_points(prune_mask)
 
     def distributed_load_ply(self, folder):
+        args = utils.get_args()
         # count the number of files like "point_cloud_rk0_ws4.ply"
         world_size = -1
         for f in os.listdir(folder):
@@ -1000,11 +1001,12 @@ class GaussianModel:
         catted_scaling = np.concatenate(catted_scaling, axis=0)
         catted_rotation = np.concatenate(catted_rotation, axis=0)
         
+        N = catted_xyz.shape[0]
+
         if self.args.offload:
             self.parameters_buffer = torch.empty(0)
             self.parameters_grad_buffer = torch.zeros(0)
         
-            N = catted_xyz.shape[0]
             if catted_features_dc.ndim == 3:
                 catted_features_dc = np.transpose(catted_features_dc, (0, 2, 1)).reshape(N, -1)
             if catted_features_rest.ndim == 3:
@@ -1042,35 +1044,67 @@ class GaussianModel:
                 )
                 
             elif self.args.gpu_cache == "xyzosr":
-                self.parameters_buffer = torch.empty((self.args.prealloc_capacity, 48), dtype=torch.float, pin_memory=True)
-                self.parameters_grad_buffer = torch.zeros((self.args.prealloc_capacity, 48), dtype=torch.float, pin_memory=True)
-                
-                self.parameters_buffer[:N] = torch.tensor(np.concatenate((catted_features_dc, catted_features_rest), axis=1))
-                self._parameters = nn.Parameter(
-                    self.parameters_buffer[:N].requires_grad_(True)
-                )
-                self._features_dc, self._features_rest = torch.split(self._parameters, [3, 45], dim=1) 
-                
                 self._xyz = nn.Parameter(
                     torch.tensor(
                         catted_xyz, dtype=torch.float, device="cuda"
                     ).requires_grad_(True)
                 )
-                self._opacity = nn.Parameter(
-                    torch.tensor(
-                        catted_opacity, dtype=torch.float, device="cuda"
-                    ).requires_grad_(True)
-                )
-                self._scaling = nn.Parameter(
-                    torch.tensor(
-                        catted_scaling, dtype=torch.float, device="cuda"
-                    ).requires_grad_(True)
-                )
-                self._rotation = nn.Parameter(
-                    torch.tensor(
-                        catted_rotation, dtype=torch.float, device="cuda"
-                    ).requires_grad_(True)
-                )
+
+                parameters_buffer_array = numba.cuda.pinned_array((self.args.prealloc_capacity, 48), dtype=np.float32)
+                self.parameters_buffer = torch.from_numpy(parameters_buffer_array)
+                parameters_grad_buffer_array = numba.cuda.pinned_array((self.args.prealloc_capacity, 48), dtype=np.float32)
+                self.parameters_grad_buffer = torch.from_numpy(parameters_grad_buffer_array).zero_()
+                assert self.parameters_buffer.is_pinned()
+                assert self.parameters_grad_buffer.is_pinned()
+
+                
+                if args.reinit_ply:
+                    torch.cat((torch.from_numpy(catted_features_dc), torch.from_numpy(catted_features_rest)), dim=1, out=self.parameters_buffer[:N])
+                    # self.parameters_buffer[:N] = torch.tensor(np.concatenate((catted_features_dc, catted_features_rest), axis=1))
+                    self.parameters_buffer[:N, 3:] = 0.0
+                    self._parameters = nn.Parameter(
+                        self.parameters_buffer[:N].requires_grad_(True)
+                    )
+                    self._features_dc, self._features_rest = torch.split(self._parameters, [3, 45], dim=1) 
+
+                    dist2 = torch.clamp_min(
+                        distCUDA2(torch.from_numpy(catted_xyz).float().cuda()),
+                        0.0000001,
+                    )
+                    scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3).to("cuda")
+
+                    rots = torch.zeros((N, 4), device="cuda")
+                    rots[:, 0] = 1
+
+                    opacities = inverse_sigmoid(0.1 * torch.ones((N, 1), dtype=torch.float, device="cuda"))
+                    
+                    self._scaling = nn.Parameter(scales.requires_grad_(True))
+                    self._rotation = nn.Parameter(rots.requires_grad_(True))
+                    self._opacity = nn.Parameter(opacities.requires_grad_(True))
+                    
+                    self.max_radii2D = torch.zeros((N), device="cuda")
+                    self.sum_visible_count_in_one_batch = torch.zeros((N), device="cuda")
+                else:
+                    self.parameters_buffer[:N] = torch.tensor(np.concatenate((catted_features_dc, catted_features_rest), axis=1))
+                    self._parameters = nn.Parameter(
+                        self.parameters_buffer[:N].requires_grad_(True)
+                    )
+                    self._features_dc, self._features_rest = torch.split(self._parameters, [3, 45], dim=1) 
+                    self._opacity = nn.Parameter(
+                        torch.tensor(
+                            catted_opacity, dtype=torch.float, device="cuda"
+                        ).requires_grad_(True)
+                    )
+                    self._scaling = nn.Parameter(
+                        torch.tensor(
+                            catted_scaling, dtype=torch.float, device="cuda"
+                        ).requires_grad_(True)
+                    )
+                    self._rotation = nn.Parameter(
+                        torch.tensor(
+                            catted_rotation, dtype=torch.float, device="cuda"
+                        ).requires_grad_(True)
+                    )
                 self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
                 self.sum_visible_count_in_one_batch = torch.zeros(
                     (self.get_xyz.shape[0]), device="cuda"
@@ -1091,28 +1125,67 @@ class GaussianModel:
                 .contiguous()
                 .requires_grad_(True)
             )
-            self._features_rest = nn.Parameter(
-                torch.tensor(catted_features_rest, dtype=torch.float, device="cuda")
-                .transpose(1, 2)
-                .contiguous()
-                .requires_grad_(True)
-            )
-            self._opacity = nn.Parameter(
-                torch.tensor(
-                    catted_opacity, dtype=torch.float, device="cuda"
-                ).requires_grad_(True)
-            )
-            self._scaling = nn.Parameter(
-                torch.tensor(
-                    catted_scaling, dtype=torch.float, device="cuda"
-                ).requires_grad_(True)
-            )
-            self._rotation = nn.Parameter(
-                torch.tensor(
-                    catted_rotation, dtype=torch.float, device="cuda"
-                ).requires_grad_(True)
-            )
-            self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+            if args.reinit_ply:
+                self._features_rest = nn.Parameter(
+                    torch.tensor(catted_features_rest, dtype=torch.float, device="cuda")
+                    .transpose(1, 2)
+                    .contiguous()
+                    .zero_()
+                    .requires_grad_(True)
+                )
+
+                dist2 = torch.clamp_min(
+                    distCUDA2(torch.from_numpy(catted_xyz).float().cuda()),
+                    0.0000001,
+                )
+                scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3).to("cuda")    
+
+                rots = torch.zeros((N, 4), device="cuda")
+                rots[:, 0] = 1
+
+                opacities = inverse_sigmoid(
+                    0.1
+                    * torch.ones(
+                        (N, 1), dtype=torch.float, device="cuda"
+                    )
+                )
+
+                self._scaling = nn.Parameter(scales.requires_grad_(True))
+                self._rotation = nn.Parameter(rots.requires_grad_(True))
+                self._opacity = nn.Parameter(opacities.requires_grad_(True))
+                self.max_radii2D = torch.zeros((N,), device="cuda")
+                self.sum_visible_count_in_one_batch = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+            else:
+                self._features_dc = nn.Parameter(
+                    torch.tensor(catted_features_dc, dtype=torch.float, device="cuda")
+                    .transpose(1, 2)
+                    .contiguous()
+                    .requires_grad_(True)
+                )
+                self._features_rest = nn.Parameter(
+                    torch.tensor(catted_features_rest, dtype=torch.float, device="cuda")
+                    .transpose(1, 2)
+                    .contiguous()
+                    .requires_grad_(True)
+                )
+                self._opacity = nn.Parameter(
+                    torch.tensor(
+                        catted_opacity, dtype=torch.float, device="cuda"
+                    ).requires_grad_(True)
+                )
+                self._scaling = nn.Parameter(
+                    torch.tensor(
+                        catted_scaling, dtype=torch.float, device="cuda"
+                    ).requires_grad_(True)
+                )
+                self._rotation = nn.Parameter(
+                    torch.tensor(
+                        catted_rotation, dtype=torch.float, device="cuda"
+                    ).requires_grad_(True)
+                )
+                self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
         self.active_sh_degree = self.max_sh_degree
 
