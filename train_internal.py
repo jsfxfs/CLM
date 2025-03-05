@@ -4780,6 +4780,255 @@ def baseline_accumGrads_micro_step(
     return rendered_image, means2D, radiis, gaussian_ids
 
 
+def pipeline_forward_one_step(
+    filtered_opacity_gpu,
+    filtered_scaling_gpu,
+    filtered_rotation_gpu,
+    filtered_xyz_gpu,
+    filtered_shs,
+    camera,
+    scene,
+    gaussians,
+    background,
+    pipe_args,
+    eval=False,
+):
+    image_width = int(utils.get_img_width())
+    image_height = int(utils.get_img_height())
+    tanfovx = math.tan(camera.FoVx * 0.5)
+    tanfovy = math.tan(camera.FoVy * 0.5)
+    focal_length_x = image_width / (2 * tanfovx)
+    focal_length_y = image_height / (2 * tanfovy)
+    K = torch.tensor(
+        [
+            [focal_length_x, 0, image_width / 2.0],
+            [0, focal_length_y, image_height / 2.0],
+            [0, 0, 1],
+        ],
+        device="cuda",
+    )
+    assert K.shape == (3, 3)
+
+    viewmat = camera.world_view_transform.transpose(0, 1)  # why transpose
+    n_selected = filtered_xyz_gpu.shape[0]
+    tile_size = 16
+    B = 1 # micro batch size is just 1
+
+    batched_radiis, batched_means2D, batched_depths, batched_conics, _ = (
+        fully_fused_projection(
+            means=filtered_xyz_gpu, # (N, 3)
+            covars=None,
+            quats=filtered_rotation_gpu,
+            scales=filtered_scaling_gpu,
+            viewmats=viewmat.unsqueeze(0),
+            Ks=K.unsqueeze(0),
+            width=image_width,
+            height=image_height,
+            packed=False,
+        )
+    ) # (1, N), (1, N, 2), (1, N), (1, N, 3), (1, N)
+
+    if not eval:
+        batched_means2D.retain_grad() # this is only for training. 
+
+    sh_degree = gaussians.active_sh_degree
+    # camtoworlds = torch.inverse(viewmat.unsqueeze(0)) # (4, 4)
+    camtoworlds = torch.inverse(viewmat.unsqueeze(0))
+    dirs = filtered_xyz_gpu[None, :, :] - camtoworlds[:, None, :3, 3]
+    filtered_shs = filtered_shs.reshape(1, n_selected, 16, 3)
+    batched_colors = spherical_harmonics(
+        degrees_to_use=sh_degree, dirs=dirs, coeffs=filtered_shs
+    )
+    batched_colors = torch.clamp_min(batched_colors + 0.5, 0.0) # (1, N, 3)
+    batched_opacities = filtered_opacity_gpu.squeeze(1).unsqueeze(0) # (N, 1) -> (1, N)
+
+    # NOTE: In the above code, we keep the first batch dimension, even if it is always 1. 
+
+    # render
+    # Identify intersecting tiles.
+    tile_width = math.ceil(image_width / float(tile_size))
+    tile_height = math.ceil(image_height / float(tile_size))
+
+    # flatten_ids: (C*N)
+    _, isect_ids, flatten_ids = isect_tiles(
+        means2d=batched_means2D,
+        radii=batched_radiis,
+        depths=batched_depths,
+        tile_size=tile_size,
+        tile_width=tile_width,
+        tile_height=tile_height,
+        packed=False,
+    )
+    isect_offsets = isect_offset_encode(
+        isect_ids, B, tile_width, tile_height
+    )  # (B, tile_height, tile_width)
+
+    # no need for now
+    # global max_num_intersection
+    # num_intersection = isect_ids.shape[0]
+    # max_num_intersection = max(max_num_intersection, num_intersection)    
+    # args = utils.get_args()
+    # iteration = utils.get_cur_iter()
+    # log_file = utils.get_log_file()
+    # if (iteration % args.log_interval) == 1:
+    #     log_file.write(
+    #         "<<< # iteration: {}, # intersections = {}, max # intersections = {} >>>\n".format(iteration, num_intersection, max_num_intersection)
+    #     )
+
+    # TODO: One way to do load balancing: Add two timer operators before and after `rasterize_to_pixels`
+    # record_time_start : torch operator(torch.autograd.func)
+
+    # Rasterize to pixels. batched_rendered_image: (B, image_height, image_width, 3)
+    backgrounds = (
+        background.repeat(B, 1) if background is not None else None
+    )
+    rendered_image, _ = rasterize_to_pixels(
+        means2d=batched_means2D,
+        conics=batched_conics,
+        colors=batched_colors,
+        opacities=batched_opacities,
+        image_width=image_width,
+        image_height=image_height,
+        tile_size=tile_size,
+        isect_offsets=isect_offsets,
+        flatten_ids=flatten_ids,
+        backgrounds=backgrounds,
+    )
+
+    rendered_image = rendered_image.squeeze(0).permute(2, 0, 1).contiguous()
+
+    return rendered_image, batched_means2D, batched_radiis
+    
+
+
+def fairBaseline_accumGrads_impl(
+    gaussians,
+    scene,
+    batched_cameras,
+    background,
+    scaling_modifier=1.0,
+    sparse_adam=False,
+):
+    args = utils.get_args()
+    iteration = utils.get_cur_iter()
+    log_file = utils.get_log_file()
+
+    assert not args.packed
+    assert args.disable_auto_densification
+
+    bsz = len(batched_cameras)
+    n_gaussians = gaussians._xyz.shape[0]
+
+    with torch.no_grad():
+        # prepare all parameters
+        xyz_gpu = gaussians.get_xyz
+        opacity_gpu_origin = gaussians.get_opacity
+        scaling_gpu_origin = gaussians.get_scaling
+        rotation_gpu_origin = gaussians.get_rotation
+        sh_degree = gaussians.active_sh_degree
+
+        torch.cuda.nvtx.range_push("calculate_filters")
+        # calculate gaussian visible filters for all cameras
+        filters, camera_ids, gaussian_ids = calculate_filters(
+            batched_cameras,
+            xyz_gpu,
+            opacity_gpu_origin,
+            scaling_gpu_origin,
+            rotation_gpu_origin
+        ) # list of GPU long tensors. len(cameras)
+        del opacity_gpu_origin, scaling_gpu_origin, rotation_gpu_origin
+        torch.cuda.nvtx.range_pop()
+
+
+    torch.cuda.nvtx.range_push("prealloc space for grads")
+    gaussians._xyz.grad = torch.zeros_like(gaussians._xyz)
+    gaussians._opacity.grad = torch.zeros_like(gaussians._opacity)
+    gaussians._scaling.grad = torch.zeros_like(gaussians._scaling)
+    gaussians._rotation.grad = torch.zeros_like(gaussians._rotation)
+    gaussians._features_dc.grad = torch.zeros_like(gaussians._features_dc)
+    gaussians._features_rest.grad = torch.zeros_like(gaussians._features_rest)
+    torch.cuda.nvtx.range_pop()
+
+    losses = []
+    visibility = torch.zeros((n_gaussians,), dtype=torch.bool, device="cuda") if sparse_adam else None
+
+    for micro_idx, camera in enumerate(batched_cameras):
+        torch.cuda.nvtx.range_push(f"micro idx {micro_idx}")
+
+        this_filter = filters[micro_idx]
+
+        torch.cuda.nvtx.range_push("prepare filtered parameters")
+        filtered_xyz = torch.gather(gaussians._xyz.detach(), 0, this_filter.reshape(-1, 1).expand(-1, 3)).requires_grad_(True)
+        _filtered_opacity = torch.gather(gaussians._opacity.detach(), 0, this_filter.reshape(-1, 1)).requires_grad_(True)
+        _filtered_scaling = torch.gather(gaussians._scaling.detach(), 0, this_filter.reshape(-1, 1).expand(-1, 3)).requires_grad_(True)
+        _filtered_rotation = torch.gather(gaussians._rotation.detach(), 0, this_filter.reshape(-1, 1).expand(-1, 4)).requires_grad_(True)
+        
+        _filtered_features_dc = torch.gather(gaussians._features_dc.detach().view(-1, 3), 0, this_filter.reshape(-1, 1).expand(-1, 3)).requires_grad_(True)
+        _filtered_features_rest = torch.gather(gaussians._features_rest.detach().view(-1, 45), 0, this_filter.reshape(-1, 1).expand(-1, 45)).requires_grad_(True)
+
+        filtered_opacity = gaussians.opacity_activation(_filtered_opacity)
+        filtered_scaling = gaussians.scaling_activation(_filtered_scaling)
+        filtered_rotation = gaussians.rotation_activation(_filtered_rotation)
+        filtered_shs = torch.cat((_filtered_features_dc, _filtered_features_rest), dim=1)
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("forward")
+        rendered_image, means2D, radiis = pipeline_forward_one_step(
+            filtered_opacity,
+            filtered_scaling,
+            filtered_rotation,
+            filtered_xyz,
+            filtered_shs,
+            camera,
+            scene,
+            gaussians,
+            background,
+            None
+        )
+        loss = torch_compiled_loss(rendered_image, camera.original_image)
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("backward")
+        loss.backward()
+        torch.cuda.nvtx.range_pop()
+        losses.append(loss.detach())
+
+        with torch.no_grad():
+            torch.cuda.nvtx.range_push("scatter gpu grads back to origin")
+            gaussians._xyz.grad.scatter_add_(dim=0, src=filtered_xyz.grad, index=this_filter.reshape(-1, 1).expand(-1, 3))
+            gaussians._opacity.grad.scatter_add_(dim=0, src=_filtered_opacity.grad, index=this_filter.reshape(-1, 1))
+            gaussians._scaling.grad.scatter_add_(dim=0, src=_filtered_scaling.grad, index=this_filter.reshape(-1, 1).expand(-1, 3))
+            gaussians._rotation.grad.scatter_add_(dim=0, src=_filtered_rotation.grad, index=this_filter.reshape(-1, 1).expand(-1, 4))
+            gaussians._features_dc.grad.view(-1, 3).scatter_add_(dim=0, src=_filtered_features_dc.grad, index=this_filter.reshape(-1, 1).expand(-1, 3))
+            gaussians._features_rest.grad.view(-1, 45).scatter_add_(dim=0, src=_filtered_features_rest.grad, index=this_filter.reshape(-1, 1).expand(-1, 45))
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("update stats")
+            # Update densification state.
+            update_densification_stats_baseline_accumGrads(
+                scene,
+                gaussians,
+                int(utils.get_img_height()),
+                int(utils.get_img_width()),
+                means2D.grad,
+                radiis,
+                filters[micro_idx],
+            )
+            torch.cuda.nvtx.range_pop()
+
+        if sparse_adam:
+            torch.cuda.nvtx.range_push("update visibility")
+            src = torch.ones((len(filters[micro_idx]),), dtype=torch.bool, device="cuda")
+            visibility.scatter_(dim=0, index=filters[micro_idx], src=src)
+            del src
+            torch.cuda.nvtx.range_pop()
+        
+        del loss, rendered_image, means2D, radiis
+        torch.cuda.nvtx.range_pop()
+
+    return losses, visibility
+
+
 def baseline_accumGrads_impl(
     gaussians,
     scene,
@@ -5451,15 +5700,24 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     batched_compute_locally = None
         elif args.accumulate_grads:
             assert args.backend == "gsplat"
-                
-            losses, visibility = baseline_accumGrads_impl(
-                gaussians,
-                scene,
-                batched_cameras,
-                background,
-                sparse_adam=args.sparse_adam,
-                packed=args.packed,
-            )
+
+            if args.fairBaseline:
+                losses, visibility = fairBaseline_accumGrads_impl(
+                    gaussians,
+                    scene,
+                    batched_cameras,
+                    background,
+                    sparse_adam=args.sparse_adam,
+                )
+            else:   
+                losses, visibility = baseline_accumGrads_impl(
+                    gaussians,
+                    scene,
+                    batched_cameras,
+                    background,
+                    sparse_adam=args.sparse_adam,
+                    packed=args.packed,
+                )
             batched_loss = torch.stack(losses)
             batched_loss_cpu = batched_loss.cpu().numpy()
             ema_loss_for_log = (

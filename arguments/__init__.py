@@ -100,6 +100,7 @@ class AuxiliaryParams(ParamGroup):
         self.matrixcity_ocean_mask = False
         self.packed = False
         self.pipeline_mode = "final"
+        self.fairBaseline = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args): 

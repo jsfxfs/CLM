@@ -308,7 +308,7 @@ def update_densification_stats_baseline_accumGrads(
         # timers.start("densification")
 
         # timers.start("densification_update_stats")
-        if args.packed:
+        if args.packed or args.fairBaseline:
             radii = radii.squeeze(0)
 
             gaussians.max_radii2D[visibility] = torch.max(gaussians.max_radii2D[visibility], radii)
