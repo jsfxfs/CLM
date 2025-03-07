@@ -61,6 +61,7 @@ from gsplat import (
     spherical_harmonics_bwd_inplace,
 )
 from functools import reduce
+import fast_tsp
 
 def calculate_filters(
     batched_cameras,
@@ -3389,6 +3390,113 @@ def pipeline_offload_retention_optimized_v5_impl(
             assert len(finish_indices_filters) == bsz + 1, "len(finish_indices_filters) should be equal to bsz + 1"
             assert sum([len(indicies) for indicies in finish_indices_filters]) == n_gaussians, f"{sum([len(indicies) for indicies in finish_indices_filters])}, {n_gaussians}"
 
+        elif order_calculation_version == 6:
+            match bsz:
+                case 4 | 8:
+                    dtype = torch.int8
+                case 16:
+                    dtype = torch.int16
+                case 32:
+                    dtype = torch.int32
+                case 64:
+                    dtype = torch.int64
+                case _:
+                    raise ValueError("Currently supported bsz: (4, 8, 16, 32, 64).")
+
+            def order_cal_6(filters, batched_cameras):
+                torch.cuda.nvtx.range_push("init bitmap and vecs")
+                gs_bitmap = torch.zeros((n_gaussians), dtype=dtype, device="cuda")
+                for i, f in enumerate(filters):
+                    gs_bitmap.scatter_add_(dim=0, src=torch.ones((len(f),), dtype=dtype, device="cuda"), index=f)
+                    if i < bsz - 1:
+                        gs_bitmap = gs_bitmap << 1
+                torch.cuda.nvtx.range_pop()
+
+                torch.cuda.nvtx.range_push("generate distance matrix")
+                # Downsample.
+                n_sampled = n_gaussians // bsz**2
+                sampled_gaussian_ids = torch.randperm(n_gaussians, generator=perm_generator, device="cuda")[:n_sampled]
+                sampled_bitmap = torch.gather(input=gs_bitmap, dim=0, index=sampled_gaussian_ids)
+                # Unzip the bimap.
+                unziped = torch.empty((bsz, n_sampled), dtype=torch.uint8, device="cuda")
+                for i in range(bsz):
+                    unziped[i] = (sampled_bitmap & 1).to(torch.uint8)
+                    sampled_bitmap >> 1
+                # Compute distance matrix. FIXME: need a better way with less memory
+                distance_matrix = (unziped.unsqueeze(1) ^ unziped.unsqueeze(0)).sum(dim=-1).tolist() # intermediate result: (bsz, bsz, n_sampled) = n_gaussians
+                torch.cuda.nvtx.range_pop()
+
+                torch.cuda.nvtx.range_push("solve order: tsp")
+                ordered_cams = fast_tsp.find_tour(distance_matrix, 0.001)
+                torch.cuda.nvtx.range_pop()
+                batched_cameras = [batched_cameras[i] for i in ordered_cams]
+                filters = [filters[i] for i in ordered_cams]
+                sparsity = [len(filters[i]) / float(n_gaussians) for i in range(bsz)]
+
+                torch.cuda.nvtx.range_push("generate cpuadam update ls")
+                gs_bitmap.zero_()
+                for i, f in enumerate(filters):
+                    gs_bitmap.scatter_add_(dim=0, src=torch.ones((len(f),), dtype=dtype, device="cuda"), index=f)
+                    if i < bsz - 1:
+                        gs_bitmap = gs_bitmap << 1
+                ffs = torch.empty(n_gaussians, dtype=torch.uint8, device="cuda")
+                diff_gaussian_rasterization._C.extract_ffs(gs_bitmap, ffs)
+                sorted_ffs, indices = torch.sort(ffs)
+                elems, counts = torch.unique_consecutive(sorted_ffs, return_counts=True)
+                update_ls = torch.split(indices, counts.tolist(), dim=0)
+                update_ls = list(update_ls)
+                for i in range(bsz + 1):
+                    if i not in elems: # check if there is empty update
+                        update_ls.insert(i, torch.tensor([], device="cuda"))
+                update_ls = [update_ls[0]] + update_ls[:0:-1]
+
+                if args.sparse_adam:
+                    not_touched_ids = update_ls[0]
+                    src = torch.zeros((len(not_touched_ids),), dtype=torch.bool, device="cuda")
+                    visibility_mask = torch.ones((n_gaussians,), dtype=torch.bool, device="cuda").scatter_(dim=0, index=not_touched_ids, src=src)
+                else:
+                    visibility_mask = None
+                
+                torch.cuda.nvtx.range_pop()
+
+                torch.cuda.nvtx.range_push("precompute sums")
+                cnt_h = torch.empty((bsz-1,), dtype=torch.int, device="cuda")
+                cnt_d = torch.empty((bsz-1,), dtype=torch.int, device="cuda")
+                cnt_g = torch.empty((bsz-1,), dtype=torch.int, device="cuda")
+                hdg_vec = torch.empty((3, n_gaussians), dtype=torch.uint8, device="cuda")
+                for i in range(bsz-1):
+                    diff_gaussian_rasterization._C.generate_hdg(gs_bitmap, bsz-1-i, bsz-1-i-1, hdg_vec)
+                    cnt_hdg = torch.sum(hdg_vec, dim=1)
+                    cnt_h[i] = cnt_hdg[0]
+                    cnt_d[i] = cnt_hdg[1]
+                    cnt_g[i] = cnt_hdg[2]
+
+                torch.cuda.nvtx.range_pop()
+                del gs_bitmap, hdg_vec
+
+                torch.cuda.nvtx.range_push("transfer cpuadam update list and sums to cpu")
+                data2cpu_ls = update_ls + [cnt_h, cnt_d, cnt_g]
+                cat_data2cpu = torch.cat(data2cpu_ls, dim=0).to(torch.int32)
+                cat_data2cpu_h = torch.empty_like(cat_data2cpu, device="cpu", pin_memory=True)
+                data2cpu_dim = [len(d) for d in data2cpu_ls]
+                cat_data2cpu_h.copy_(cat_data2cpu)
+                data2cpu_ls_h = torch.split(cat_data2cpu_h, data2cpu_dim, dim=0)
+                assert len(data2cpu_ls_h) == bsz + 4
+                update_ls_cpu = data2cpu_ls_h[:bsz+1]
+                cnt_h = data2cpu_ls_h[-3]
+                cnt_d = data2cpu_ls_h[-2]
+                cnt_g = data2cpu_ls_h[-1]
+                torch.cuda.nvtx.range_pop()
+
+                finish_indices_filters = update_ls_cpu
+
+                assert len(finish_indices_filters) == bsz + 1, "len(finish_indices_filters) should be equal to bsz + 1"
+                assert sum([len(indicies) for indicies in finish_indices_filters]) == n_gaussians, f"{sum([len(indicies) for indicies in finish_indices_filters])}, {n_gaussians}"
+
+                return finish_indices_filters, batched_cameras, filters, sparsity, ordered_cams, cnt_h, cnt_d, cnt_g, visibility_mask
+
+            finish_indices_filters, batched_cameras, filters, sparsity, ordered_cams, cnt_h, cnt_d, cnt_g, visibility_mask = order_cal_6(filters, batched_cameras)
+            
         else:
             raise ValueError("Invalid order calculation version.")
 
@@ -4504,7 +4612,167 @@ def sparse_offload_impl(
     torch.cuda.synchronize()
 
     return losses
-    
+
+def fairBraindead_offload_impl(
+    gaussians,
+    scene,
+    batched_cameras,
+    background,
+    sparse_adam=False
+):
+    args = utils.get_args()
+    timers = utils.get_timers()
+    losses = []
+
+    bsz = len(batched_cameras)
+    n_gaussians = gaussians._xyz.shape[0]
+
+    with torch.no_grad():
+        torch.cuda.nvtx.range_push("load parameters to gpu")
+        xyz_gpu = gaussians._xyz.detach().to("cuda")
+        _opacity_gpu = gaussians._opacity.detach().to("cuda")
+        _scaling_gpu = gaussians._scaling.detach().to("cuda")
+        _rotation_gpu = gaussians._rotation.detach().to("cuda")
+        _features_dc_gpu = gaussians._features_dc.detach().to("cuda")
+        _features_rest_gpu = gaussians._features_rest.detach().to("cuda")
+        sh_degree = gaussians.active_sh_degree
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("activate critical attr")
+        opacity_gpu_origin = gaussians.opacity_activation(_opacity_gpu)
+        scaling_gpu_origin = gaussians.scaling_activation(_scaling_gpu)
+        rotation_gpu_origin = gaussians.rotation_activation(_rotation_gpu)
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("calculate_filters")
+        filters, camera_ids, gaussian_ids = calculate_filters(
+            batched_cameras,
+            xyz_gpu,
+            opacity_gpu_origin,
+            scaling_gpu_origin,
+            rotation_gpu_origin
+        ) # list of GPU long tensors. len(cameras)
+        del opacity_gpu_origin, scaling_gpu_origin, rotation_gpu_origin
+        torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("prealloc pinned memory for grads")
+    gaussians._xyz.grad = torch.empty_like(gaussians._xyz, pin_memory=True)
+    gaussians._features_dc.grad = torch.empty_like(gaussians._features_dc, pin_memory=True)
+    gaussians._features_rest.grad = torch.empty_like(gaussians._features_rest, pin_memory=True)
+    gaussians._scaling.grad = torch.empty_like(gaussians._scaling, pin_memory=True)
+    gaussians._rotation.grad = torch.empty_like(gaussians._rotation, pin_memory=True)
+    gaussians._opacity.grad = torch.empty_like(gaussians._opacity, pin_memory=True)  
+    torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("prealloc space for gpu grads")
+    xyz_gpu_grad = torch.zeros_like(xyz_gpu)
+    _opacity_gpu_grad = torch.zeros_like(_opacity_gpu)
+    _scaling_gpu_grad = torch.zeros_like(_scaling_gpu)
+    _rotation_gpu_grad = torch.zeros_like(_rotation_gpu)
+    _features_dc_gpu_grad = torch.zeros_like(_features_dc_gpu)
+    _features_rest_gpu_grad = torch.zeros_like(_features_rest_gpu)
+    torch.cuda.nvtx.range_pop()
+
+    losses = []
+    visibility = torch.zeros((xyz_gpu.shape[0],), dtype=torch.bool, device="cuda") if sparse_adam else None
+
+    for micro_idx, camera in enumerate(batched_cameras):
+        torch.cuda.nvtx.range_push(f"micro batch {micro_idx}")
+
+        this_filter = filters[micro_idx]
+
+        torch.cuda.nvtx.range_push("prepare filtered parameters")
+        filtered_xyz = torch.gather(xyz_gpu, 0, this_filter.reshape(-1, 1).expand(-1, 3)).requires_grad_(True)
+        _filtered_opacity = torch.gather(_opacity_gpu, 0, this_filter.reshape(-1, 1)).requires_grad_(True)
+        _filtered_scaling = torch.gather(_scaling_gpu, 0, this_filter.reshape(-1, 1).expand(-1, 3)).requires_grad_(True)
+        _filtered_rotation = torch.gather(_rotation_gpu, 0, this_filter.reshape(-1, 1).expand(-1, 4)).requires_grad_(True)
+        
+        _filtered_features_dc = torch.gather(_features_dc_gpu.view(-1, 3), 0, this_filter.reshape(-1, 1).expand(-1, 3)).requires_grad_(True)
+        _filtered_features_rest = torch.gather(_features_rest_gpu.view(-1, 45), 0, this_filter.reshape(-1, 1).expand(-1, 45)).requires_grad_(True)
+
+        filtered_opacity = gaussians.opacity_activation(_filtered_opacity)
+        filtered_scaling = gaussians.scaling_activation(_filtered_scaling)
+        filtered_rotation = gaussians.rotation_activation(_filtered_rotation)
+        filtered_shs = torch.cat((_filtered_features_dc, _filtered_features_rest), dim=1)
+        torch.cuda.nvtx.range_pop()
+
+        rendered_image, means2D, radiis = pipeline_forward_one_step(
+            filtered_opacity,
+            filtered_scaling,
+            filtered_rotation,
+            filtered_xyz,
+            filtered_shs,
+            camera,
+            scene,
+            gaussians,
+            background,
+            None,
+            eval=False,
+        )
+        loss = torch_compiled_loss(rendered_image, camera.original_image)
+        loss.backward()
+        losses.append(loss.detach())
+
+        # with torch.no_grad():
+            # Update densification state.
+            #  update_densification_stats_pipelineoffload_xyzosr(
+            #     scene,
+            #     gaussians,
+            #     int(utils.get_img_height()),
+            #     int(utils.get_img_width()),
+            #     torch.nonzero((radiis > 0)).flatten(),
+            #     means2D.grad.squeeze(0),
+            #     radiis.squeeze(0),
+            # )
+        
+        with torch.no_grad():
+            torch.cuda.nvtx.range_push("scatter gpu grads back to buffer of origin shape")
+            xyz_gpu_grad.scatter_add_(dim=0, src=filtered_xyz.grad, index=this_filter.reshape(-1, 1).expand(-1, 3))
+            _opacity_gpu_grad.scatter_add_(dim=0, src=_filtered_opacity.grad, index=this_filter.reshape(-1, 1))
+            _scaling_gpu_grad.scatter_add_(dim=0, src=_filtered_scaling.grad, index=this_filter.reshape(-1, 1).expand(-1, 3))
+            _rotation_gpu_grad.scatter_add_(dim=0, src=_filtered_rotation.grad, index=this_filter.reshape(-1, 1).expand(-1, 4))
+            _features_dc_gpu_grad.view(-1, 3).scatter_add_(dim=0, src=_filtered_features_dc.grad, index=this_filter.reshape(-1, 1).expand(-1, 3))
+            _features_rest_gpu_grad.view(-1, 45).scatter_add_(dim=0, src=_filtered_features_rest.grad, index=this_filter.reshape(-1, 1).expand(-1, 45))
+            torch.cuda.nvtx.range_pop()
+
+        if sparse_adam:
+            torch.cuda.nvtx.range_push("update visibility")
+            src = torch.ones((len(filters[micro_idx]),), dtype=torch.bool, device="cuda")
+            visibility.scatter_(dim=0, index=filters[micro_idx], src=src)
+            del src
+            torch.cuda.nvtx.range_pop()
+        
+        del loss, rendered_image, means2D, radiis
+        torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("send grads back to cpu")
+    gaussians._xyz.grad.copy_(xyz_gpu_grad)
+    gaussians._opacity.grad.copy_(_opacity_gpu_grad)
+    gaussians._scaling.grad.copy_(_scaling_gpu_grad)
+    gaussians._rotation.grad.copy_(_rotation_gpu_grad)
+    gaussians._features_dc.grad.copy_(_features_dc_gpu_grad)
+    gaussians._features_rest.grad.copy_(_features_rest_gpu_grad)
+    torch.cuda.nvtx.range_pop()
+
+    torch.cuda.synchronize()
+
+    timers.start("grad scale + optimizer step + zero grad")
+    for param in gaussians.all_parameters():
+        if param.grad is not None:
+            param.grad /= args.bsz
+    if not args.stop_update_param:
+        if sparse_adam:
+            sparse_indices = torch.nonzero(visibility).flatten().to(torch.int32)
+            sparse_indices = sparse_indices.to("cpu")
+            # gaussians.optimizer.sparse_adam_inc_step()
+            gaussians.optimizer.sparse_step(sparse_indices=sparse_indices)
+        else:
+            gaussians.optimizer.step()
+    gaussians.optimizer.zero_grad(set_to_none=True)
+    timers.stop("grad scale + optimizer step + zero grad")
+    torch.cuda.synchronize()  
+
+    return losses, visibility
 
 # braindeatch offload: only load the minimum workload.
 def braindeath_offload_impl(
@@ -5355,13 +5623,22 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         if args.braindeath_offload:
             N = gaussians._xyz.shape[0]
 
-            losses, visibility = braindeath_offload_impl(
-                gaussians,
-                scene,
-                batched_cameras,
-                background,
-                sparse_adam=args.sparse_adam,
-            )
+            if args.fairBraindead:
+                losses, visibility = fairBraindead_offload_impl(
+                    gaussians,
+                    scene,
+                    batched_cameras,
+                    background,
+                    sparse_adam=args.sparse_adam,
+                )
+            else:
+                losses, visibility = braindeath_offload_impl(
+                    gaussians,
+                    scene,
+                    batched_cameras,
+                    background,
+                    sparse_adam=args.sparse_adam,
+                )
             batched_screenspace_pkg = {}
 
             # Sync losses in the batch

@@ -101,6 +101,7 @@ class AuxiliaryParams(ParamGroup):
         self.packed = False
         self.pipeline_mode = "final"
         self.fairBaseline = False
+        self.fairBraindead = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args): 
