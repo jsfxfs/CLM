@@ -3530,8 +3530,8 @@ def pipeline_offload_retention_optimized_v5_impl(
                 # Unzip the bimap.
                 unziped = torch.empty((bsz, n_sampled), dtype=torch.uint8, device="cuda")
                 for i in range(bsz):
-                    unziped[i] = (sampled_bitmap & 1).to(torch.uint8)
-                    sampled_bitmap >> 1
+                    unziped[bsz-1-i] = (sampled_bitmap & 1).to(torch.uint8)
+                    sampled_bitmap = sampled_bitmap >> 1
                 # Compute distance matrix. FIXME: need a better way with less memory
                 distance_matrix = (unziped.unsqueeze(1) ^ unziped.unsqueeze(0)).sum(dim=-1).tolist() # intermediate result: (bsz, bsz, n_sampled) = n_gaussians
                 torch.cuda.nvtx.range_pop()
