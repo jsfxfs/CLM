@@ -247,6 +247,8 @@ class Scene:
                     self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter)
                 )
             )
+        elif args.load_pt_path != '':
+            self.gaussians.load_tensors(args.load_pt_path)
         elif args.load_ply_path != '':
             self.gaussians.load_ply(args.load_ply_path)
         else:

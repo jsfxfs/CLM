@@ -75,6 +75,7 @@ class AuxiliaryParams(ParamGroup):
         self.log_interval = 250
         self.load_ply_path = ""
         self.load_ply_max = 1_000_000
+        self.load_pt_path = ""
         self.llffhold = 8
         self.backend = "default" # "default", "gsplat"
         self.offload = False
@@ -102,6 +103,7 @@ class AuxiliaryParams(ParamGroup):
         self.pipeline_mode = "final"
         self.fairBaseline = False
         self.fairBraindead = False
+        self.braindead_pin = True
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args): 
@@ -247,6 +249,7 @@ class DebugParams(ParamGroup):
         self.retention = 0
         self.log_sampled_filters = 0
         self.subsample_ratio = 1.0
+        self.upsample_ratio = 0.0
         self.reinit_ply = False
 
         super().__init__(parser, "Debug Parameters")

@@ -4763,12 +4763,12 @@ def fairBraindead_offload_impl(
         torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("prealloc pinned memory for grads")
-    gaussians._xyz.grad = torch.empty_like(gaussians._xyz, pin_memory=True)
-    gaussians._features_dc.grad = torch.empty_like(gaussians._features_dc, pin_memory=True)
-    gaussians._features_rest.grad = torch.empty_like(gaussians._features_rest, pin_memory=True)
-    gaussians._scaling.grad = torch.empty_like(gaussians._scaling, pin_memory=True)
-    gaussians._rotation.grad = torch.empty_like(gaussians._rotation, pin_memory=True)
-    gaussians._opacity.grad = torch.empty_like(gaussians._opacity, pin_memory=True)  
+    gaussians._xyz.grad = torch.empty_like(gaussians._xyz, pin_memory=args.braindead_pin)
+    gaussians._features_dc.grad = torch.empty_like(gaussians._features_dc, pin_memory=args.braindead_pin)
+    gaussians._features_rest.grad = torch.empty_like(gaussians._features_rest, pin_memory=args.braindead_pin)
+    gaussians._scaling.grad = torch.empty_like(gaussians._scaling, pin_memory=args.braindead_pin)
+    gaussians._rotation.grad = torch.empty_like(gaussians._rotation, pin_memory=args.braindead_pin)
+    gaussians._opacity.grad = torch.empty_like(gaussians._opacity, pin_memory=args.braindead_pin)  
     torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("prealloc space for gpu grads")
@@ -5608,8 +5608,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     perm_generator.manual_seed(1)
 
     if args.log_sampled_filters != 0:
-        assert args.retention == 4, "Only implemented for retention v4"
-        selected_batches = torch.randperm(min(len(scene.train_cameras_info), args.iterations) // args.bsz, device="cuda", generator=perm_generator)[:args.log_sampled_filter]
+        assert args.retention >= 4, "Only implemented for retention v4 and higher"
+        selected_batches = torch.randperm(min(len(scene.train_cameras_info), args.iterations) // args.bsz, device="cuda", generator=perm_generator)[:args.log_sampled_filters]
         selected_batches = [b * args.bsz + 1 for b in selected_batches]
 
     ema_loss_for_log = 0

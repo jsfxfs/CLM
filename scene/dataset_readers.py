@@ -241,10 +241,13 @@ def readColmapSceneInfo(path, images, eval, llffhold=10):
         else:
             if utils.DEFAULT_GROUP.size() > 1:
                 torch.distributed.barrier()
-    try:
-        pcd = fetchPly(ply_path)
-    except:
+    if args.load_pt_path != "":
         pcd = None
+    else:
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
 
     scene_info = SceneInfo(
         point_cloud=pcd,

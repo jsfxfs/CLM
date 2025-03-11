@@ -317,12 +317,22 @@ class GaussianModel:
                 )
             )
 
-            self._xyz = nn.Parameter(fused_point_cloud.pin_memory().requires_grad_(True))
-            self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().pin_memory().requires_grad_(True))
-            self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().pin_memory().requires_grad_(True))
-            self._scaling = nn.Parameter(scales.pin_memory().requires_grad_(True))
-            self._rotation = nn.Parameter(rots.pin_memory().requires_grad_(True))
-            self._opacity = nn.Parameter(opacities.pin_memory().requires_grad_(True))
+            if self.args.braindead_pin:
+                self._xyz = nn.Parameter(fused_point_cloud.pin_memory().requires_grad_(True))
+                self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().pin_memory().requires_grad_(True))
+                self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().pin_memory().requires_grad_(True))
+                self._scaling = nn.Parameter(scales.pin_memory().requires_grad_(True))
+                self._rotation = nn.Parameter(rots.pin_memory().requires_grad_(True))
+                self._opacity = nn.Parameter(opacities.pin_memory().requires_grad_(True))
+            else:
+                self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+                self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+                self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+                self._scaling = nn.Parameter(scales.requires_grad_(True))
+                self._rotation = nn.Parameter(rots.requires_grad_(True))
+                self._opacity = nn.Parameter(opacities.requires_grad_(True))
+
+
             self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
             self.sum_visible_count_in_one_batch = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
@@ -823,7 +833,100 @@ class GaussianModel:
         torch.save(self._scaling, os.path.join(parent_path, "scaling.pt"))
         torch.save(self._rotation, os.path.join(parent_path, "rotation.pt"))
         torch.save(self._parameters, os.path.join(parent_path, "parameters.pt"))
-        
+
+    def load_tensors(
+        self, parent_path
+    ):
+        _xyz = torch.load(os.path.join(parent_path, "xyz.pt"), map_location="cpu")
+        _opacity = torch.load(os.path.join(parent_path, "opacity.pt"), map_location="cpu")
+        _scaling = torch.load(os.path.join(parent_path, "scaling.pt"), map_location="cpu")
+        _rotation = torch.load(os.path.join(parent_path, "rotation.pt"), map_location="cpu")
+        _features = torch.load(os.path.join(parent_path, "parameters.pt"), map_location="cpu")
+
+        N = _xyz.shape[0]
+        print("Number of points before initialization : ", N)
+
+        if self.args.upsample_ratio != 0.0:
+            assert self.args.subsample_ratio == 1.0, "Can not upsample and subsample at the same time"
+
+            up_N = int(N * self.args.upsample_ratio)
+            print("Upsample ratio: ", self.args.upsample_ratio)
+            print("Number of points after upsampling : ", N + up_N)
+
+            perm_generator = torch.Generator()
+            perm_generator.manual_seed(1)
+            upsampled_set_cpu, _ = torch.randperm(N)[:up_N].sort()
+
+            _xyz_up = _xyz[upsampled_set_cpu]
+            _opacity_up = _opacity[upsampled_set_cpu]
+            _sacling_up = _scaling[upsampled_set_cpu]
+            _rotation_up = _rotation[upsampled_set_cpu]
+            _features_up = _features[upsampled_set_cpu]
+
+            scaling_up = torch.exp(_sacling_up)
+            noise = (torch.rand_like(_xyz_up) + 0.5) * torch.clamp(scaling_up, max=30)
+            _xyz_up.add_(noise)
+            _xyz = torch.cat((_xyz, _xyz_up), dim=0)
+            _opacity = torch.cat((_opacity, _opacity_up))
+            _scaling = torch.cat((_scaling, _sacling_up))
+            _rotation = torch.cat((_rotation, _rotation_up))
+            _features = torch.cat((_features, _features_up))
+            N = N + up_N
+
+        elif self.args.subsample_ratio != 1.0:
+            assert self.args.subsample_ratio > 0 and self.args.subsample_ratio < 1
+            sub_N = int(N * self.args.subsample_ratio)
+            print("Subsample ratio: ", self.args.subsample_ratio)
+            print("Number of points after subsampling : ", sub_N)
+
+            perm_generator = torch.Generator()
+            perm_generator.manual_seed(1)
+            subsampled_set_cpu, _ = torch.randperm(N)[:sub_N].sort()
+
+            _xyz = _xyz[subsampled_set_cpu]
+            _opacity = _opacity[subsampled_set_cpu]
+            _scaling = _scaling[subsampled_set_cpu]
+            _rotation = _rotation[subsampled_set_cpu]
+            _features = _features[subsampled_set_cpu]
+            N = sub_N
+
+        if self.args.offload:
+            if self.args.braindeath_offload or self.args.gpu_cache == "no_cache":
+                self._xyz = nn.Parameter(_xyz.pin_memory()).requires_grad_(True)
+                self._opacity = nn.Parameter(_opacity.pin_memory()).requires_grad_(True)
+                self._scaling = nn.Parameter(_scaling.pin_memory()).requires_grad_(True)
+                self._rotation = nn.Parameter(_rotation.pin_memory()).requires_grad_(True)
+                self._parameters = nn.Parameter(_features.pin_memory()).requires_grad_(True)
+                self._features_dc, self._features_rest = torch.split(self._parameters, [3, 45], dim=1) 
+
+            else:
+                assert self.args.gpu_cache == "xyzosr"
+                parameters_buffer_array = numba.cuda.pinned_array((self.args.prealloc_capacity, 48), dtype=np.float32)
+                self.parameters_buffer = torch.from_numpy(parameters_buffer_array)
+                parameters_grad_buffer_array = numba.cuda.pinned_array((self.args.prealloc_capacity, 48), dtype=np.float32)
+                self.parameters_grad_buffer = torch.from_numpy(parameters_grad_buffer_array)
+                assert self.parameters_buffer.is_pinned()
+                assert self.parameters_grad_buffer.is_pinned()
+
+                self._xyz = nn.Parameter(_xyz.to("cuda")).requires_grad_(True)
+                self._opacity = nn.Parameter(_opacity.to("cuda")).requires_grad_(True)
+                self._scaling = nn.Parameter(_scaling.to("cuda")).requires_grad_(True)
+                self._rotation = nn.Parameter(_rotation.to("cuda")).requires_grad_(True)
+                self.parameters_buffer[:N].copy_(_features)
+                self._parameters = nn.Parameter(self.parameters_buffer[:N]).requires_grad_(True)
+                self._features_dc, self._features_rest = torch.split(self._parameters, [3, 45], dim=1) 
+                    
+        else:
+            self._xyz = nn.Parameter(_xyz.to("cuda")).requires_grad_(True)
+            self._opacity = nn.Parameter(_opacity.to("cuda")).requires_grad_(True)
+            self._scaling = nn.Parameter(_scaling.to("cuda")).requires_grad_(True)
+            self._rotation = nn.Parameter(_rotation.to("cuda")).requires_grad_(True)
+            self._features_dc = nn.Parameter(_features[:, :3].reshape(-1, 1, 3).to("cuda")).requires_grad_(True)
+            self._features_rest = nn.Parameter(_features[:, 3:].reshape(-1, 15, 3).to("cuda")).requires_grad_(True)
+
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.active_sh_degree = self.max_sh_degree
+
     def save_sub_plys(
         self, path, n_split, split_size
     ):
