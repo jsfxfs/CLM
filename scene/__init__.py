@@ -20,7 +20,7 @@ from scene.gaussian_model import GaussianModel
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON, loadCam, predecode_dataset_to_disk, clean_up_disk, loadCam_raw_from_disk
 import utils.general_utils as utils
 import psutil
-
+from scene.cameras import set_space_sort_key_dim
 
 class Scene:
 
@@ -259,6 +259,11 @@ class Scene:
 
         utils.check_initial_gpu_memory_usage("after initializing point cloud")
         utils.log_cpu_memory_usage("after loading initial 3dgs points")
+
+        # get the longest axis in self.gaussians
+        longest_axis = (self.gaussians._xyz.max(0)[0] - self.gaussians._xyz.min(0)[0]).argmax().item()
+        # import pdb; pdb.set_trace()
+        set_space_sort_key_dim(longest_axis)
 
     def save_tensors(self, iteration):
         parent_path = os.path.join(

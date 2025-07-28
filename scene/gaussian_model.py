@@ -1335,6 +1335,24 @@ class GaussianModel:
                     _features_dc = torch.cat((_features_dc, _features_dc_up))
                     _features_rest = torch.cat((_features_rest, _features_rest_up))
                     N = N + up_N
+                
+                elif args.subsample_ratio != 1.0:
+                    assert self.args.subsample_ratio > 0 and self.args.subsample_ratio < 1
+                    sub_N = int(N * self.args.subsample_ratio)
+                    print("Subsample ratio: ", self.args.subsample_ratio)
+                    print("Number of points after subsampling : ", sub_N)
+
+                    perm_generator = torch.Generator()
+                    perm_generator.manual_seed(1)
+                    subsampled_set_cpu, _ = torch.randperm(N)[:sub_N].sort()
+
+                    _xyz = _xyz[subsampled_set_cpu]
+                    _opacity = _opacity[subsampled_set_cpu]
+                    _scaling = _scaling[subsampled_set_cpu]
+                    _rotation = _rotation[subsampled_set_cpu]
+                    _features_dc = _features_dc[subsampled_set_cpu]
+                    _features_rest = _features_rest[subsampled_set_cpu]
+                    N = sub_N
 
                 self._xyz = nn.Parameter(
                     _xyz.to(torch.float).to("cuda").requires_grad_(True)

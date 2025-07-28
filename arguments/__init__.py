@@ -206,6 +206,8 @@ class DistributionParams(ParamGroup):
         self.adam_type = "default_adam"  # "default_adam", "cpu_adam"
 
         self.exact_filter = True
+        self.log_cpu_adam_trailing_overhead = False
+        self.cpu_adam_trailing_overhead = {"step": 1, "from_default_stream": 0.0, "from_comm_stream": 0.0}
 
         super().__init__(parser, "Distribution Parameters")
 

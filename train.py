@@ -28,6 +28,7 @@ from arguments import (
     init_args,
 )
 import train_internal
+import psutil
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -83,6 +84,9 @@ if __name__ == "__main__":
     )
     utils.set_log_file(log_file)
     print_all_args(args, log_file)
+
+    p = psutil.Process()
+    log_file.write(f"Initial pinned memory: {p.memory_info().shared / 1024 / 1024 / 1024} GB\n")
 
     train_internal.training(
         lp.extract(args), op.extract(args), pp.extract(args), args, log_file

@@ -18,6 +18,19 @@ import utils.general_utils as utils
 import time
 import math
 
+SPACE_SORT_KEY_DIM = -1
+
+def set_space_sort_key_dim(dim):
+    global SPACE_SORT_KEY_DIM
+    # import pdb; pdb.set_trace()
+    SPACE_SORT_KEY_DIM = dim
+
+def get_space_sort_key_dim():
+    global SPACE_SORT_KEY_DIM
+    if SPACE_SORT_KEY_DIM == -1:
+        raise ValueError("SPACE_SORT_KEY_DIM is not set. Please set it using set_space_sort_key_dim(dim).")
+    return SPACE_SORT_KEY_DIM
+
 class Camera(nn.Module):
     def __init__(
         self,
@@ -100,6 +113,7 @@ class Camera(nn.Module):
             )
         ).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+        self.camera_center_cpu = self.camera_center.cpu().tolist() # [x,y,z]
 
         # self.K = self.create_k_on_gpu()
     

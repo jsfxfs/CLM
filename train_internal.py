@@ -62,6 +62,7 @@ from gsplat import (
 )
 from functools import reduce
 import fast_tsp
+from scene.cameras import get_space_sort_key_dim
 
 def calculate_filters(
     batched_cameras,
@@ -3133,8 +3134,12 @@ def pipeline_offload_retention_optimized_v5_impl(
         torch.cuda.nvtx.range_pop()
 
     if log_this_batch_filter:
+        # batched_cameras[i].camera_center_cpu[key_dim]
+        key_dim = get_space_sort_key_dim()
         f_dump = {
             "iteration": iteration,
+            "camera_centers": [batched_cameras[i].camera_center_cpu for i in range(bsz)],
+            "key_dim": key_dim,
             "filters": [f.tolist() for f in filters],
         }
         with open(os.path.join(args.model_path, "sampled_filters.log"), 'a') as file:
@@ -3621,7 +3626,115 @@ def pipeline_offload_retention_optimized_v5_impl(
                 return finish_indices_filters, batched_cameras, filters, sparsity, ordered_cams, cnt_h, cnt_d, cnt_g, visibility_mask
 
             finish_indices_filters, batched_cameras, filters, sparsity, ordered_cams, cnt_h, cnt_d, cnt_g, visibility_mask = order_cal_7(filters, batched_cameras)
-            
+        elif order_calculation_version in [8, 9, 10]:
+            match bsz:
+                case 4 | 8:
+                    dtype = torch.int8
+                case 16:
+                    dtype = torch.int16
+                case 32:
+                    dtype = torch.int32
+                case 64:
+                    dtype = torch.int64
+                case _:
+                    raise ValueError("Currently supported bsz: (4, 8, 16, 32, 64).")
+
+            def order_cal_8(filters, batched_cameras):
+                torch.cuda.nvtx.range_push("init bitmap and vecs")
+                gs_bitmap = torch.zeros((n_gaussians), dtype=dtype, device="cuda")
+                # Encode bitmap: MSB->first microbatch; LSB->last microbatch
+                for i, f in enumerate(filters):
+                    diff_gaussian_rasterization._C.scatter_to_bit(gs_bitmap, f, bsz-1-i)
+    
+                torch.cuda.nvtx.range_pop()
+
+                torch.cuda.nvtx.range_push("solve order")
+                # sort by len(filters[i]) decreasingly
+                if order_calculation_version == 8:
+                    ordered_cams = sorted(range(bsz), key=lambda i: len(filters[i]), reverse=True)
+                elif order_calculation_version == 9:
+                    key_dim = get_space_sort_key_dim()
+                    ordered_cams = sorted(range(bsz), key=lambda i: batched_cameras[i].camera_center_cpu[key_dim])
+                elif order_calculation_version == 10:
+                    ordered_cams = list(range(bsz))
+                else:
+                    raise ValueError("Invalid order calculation version.")
+                torch.cuda.nvtx.range_pop()
+
+                batched_cameras = [batched_cameras[i] for i in ordered_cams]
+                filters = [filters[i] for i in ordered_cams]
+                sparsity = [len(filters[i]) / float(n_gaussians) for i in range(bsz)]
+
+                torch.cuda.nvtx.range_push("generate cpuadam update ls")
+                # Re-encode the bitmap based on given order
+                gs_bitmap.zero_()
+                for i, f in enumerate(filters):
+                    diff_gaussian_rasterization._C.scatter_to_bit(gs_bitmap, f, bsz-1-i)
+
+                ffs = torch.empty(n_gaussians, dtype=torch.uint8, device="cuda")
+                diff_gaussian_rasterization._C.extract_ffs(gs_bitmap, ffs)
+                sorted_ffs, indices = torch.sort(ffs)
+                elems, counts = torch.unique_consecutive(sorted_ffs, return_counts=True)
+                update_ls = torch.split(indices, counts.tolist(), dim=0)
+                update_ls = list(update_ls)
+                for i in range(bsz + 1):
+                    if i not in elems: # check if there is empty update
+                        update_ls.insert(i, torch.tensor([], device="cuda"))
+                update_ls = [update_ls[0]] + update_ls[:0:-1]
+
+                if args.sparse_adam:
+                    not_touched_ids = update_ls[0]
+                    src = torch.zeros((len(not_touched_ids),), dtype=torch.bool, device="cuda")
+                    visibility_mask = torch.ones((n_gaussians,), dtype=torch.bool, device="cuda").scatter_(dim=0, index=not_touched_ids, src=src)
+                else:
+                    visibility_mask = None
+                torch.cuda.nvtx.range_pop()
+
+                # HACK: Testing bsz=32/64 for now
+                torch.cuda.nvtx.range_push("precompute sums")
+                ps_grid_size, ps_blk_size = (64, 256)
+                tmp_buffer = torch.empty((bsz-1, ps_grid_size * ps_blk_size), dtype=torch.int, device="cuda") # 31 * #t
+                diff_gaussian_rasterization._C.compute_cnt_h(gs_bitmap, tmp_buffer, ps_grid_size, ps_blk_size)
+                cnt_d = torch.sum(tmp_buffer, dim=1).flatten()
+                filter_len = torch.tensor([len(f) for f in filters], device="cuda")
+                cnt_h = filter_len[1:] - cnt_d
+                cnt_g = filter_len[:-1] - cnt_d
+
+                torch.cuda.nvtx.range_pop()
+                del gs_bitmap, tmp_buffer, filter_len
+
+                torch.cuda.nvtx.range_push("transfer cpuadam update list and sums to cpu")
+                data2cpu_ls = update_ls + [cnt_h, cnt_d, cnt_g]
+                cat_data2cpu = torch.cat(data2cpu_ls, dim=0).to(torch.int32)
+                cat_data2cpu_h = torch.empty_like(cat_data2cpu, device="cpu", pin_memory=True)
+                data2cpu_dim = [len(d) for d in data2cpu_ls]
+                cat_data2cpu_h.copy_(cat_data2cpu)
+                data2cpu_ls_h = torch.split(cat_data2cpu_h, data2cpu_dim, dim=0)
+                assert len(data2cpu_ls_h) == bsz + 4
+                update_ls_cpu = data2cpu_ls_h[:bsz+1]
+                cnt_h = data2cpu_ls_h[-3]
+                cnt_d = data2cpu_ls_h[-2]
+                cnt_g = data2cpu_ls_h[-1]
+                torch.cuda.nvtx.range_pop()
+
+                finish_indices_filters = update_ls_cpu
+                if args.delay_cpuadam_notaccessed_gs:
+                    finish_indices_filters = list(finish_indices_filters)
+
+                    filter_0 = finish_indices_filters[0] # a tensor
+                    filter_last = finish_indices_filters[-1] # a tensor
+                    
+                    finish_indices_filters[0] = filter_0[:0] # empty tensor
+                    finish_indices_filters[-1] = torch.cat([filter_last, filter_0], dim=0) # a tensor
+
+                    finish_indices_filters = tuple(finish_indices_filters)
+
+                assert len(finish_indices_filters) == bsz + 1, "len(finish_indices_filters) should be equal to bsz + 1"
+                assert sum([len(indicies) for indicies in finish_indices_filters]) == n_gaussians, f"{sum([len(indicies) for indicies in finish_indices_filters])}, {n_gaussians}"
+
+                return finish_indices_filters, batched_cameras, filters, sparsity, ordered_cams, cnt_h, cnt_d, cnt_g, visibility_mask
+
+            finish_indices_filters, batched_cameras, filters, sparsity, ordered_cams, cnt_h, cnt_d, cnt_g, visibility_mask = order_cal_8(filters, batched_cameras)
         else:
             raise ValueError("Invalid order calculation version.")
 
@@ -3951,7 +4064,24 @@ def pipeline_offload_retention_optimized_v5_impl(
             else:
                 gaussians.optimizer.gpu_adam.step()
         gaussians.optimizer.gpu_adam.zero_grad(set_to_none=True)
+        if args.log_cpu_adam_trailing_overhead:
+            cpu_adam_trail_default_start_event = torch.cuda.Event(enable_timing=True)
+            cpu_adam_trail_default_end_event = torch.cuda.Event(enable_timing=True)
+            cpu_adam_trail_default_start_event.record(default_stream)
+
+            cpu_adam_trail_comm_start_event = torch.cuda.Event(enable_timing=True)
+            cpu_adam_trail_comm_end_event = torch.cuda.Event(enable_timing=True)
+            cpu_adam_trail_comm_start_event.record(comm_stream)
         cpuadam_worker.join()
+        if args.log_cpu_adam_trailing_overhead:
+            cpu_adam_trail_default_end_event.record(default_stream)
+            cpu_adam_trail_default_start_event.synchronize()
+            cpu_adam_trail_comm_end_event.record(comm_stream)
+            cpu_adam_trail_comm_start_event.synchronize()
+            args.cpu_adam_trailing_overhead["step"] += 1
+            if args.cpu_adam_trailing_overhead["step"] > 3:
+                args.cpu_adam_trailing_overhead["from_default_stream"] += cpu_adam_trail_default_start_event.elapsed_time(cpu_adam_trail_default_end_event)
+                args.cpu_adam_trailing_overhead["from_comm_stream"] += cpu_adam_trail_comm_start_event.elapsed_time(cpu_adam_trail_comm_end_event)
         utils.memory_report("after cpuadam_worker joined")
     else:
         torch.cuda.synchronize() # we need to make sure gradients have all been sent back to cpu. 
@@ -4882,6 +5012,11 @@ def fairBraindead_offload_impl(
     torch.cuda.synchronize()
 
     timers.start("grad scale + optimizer step + zero grad")
+    if args.log_cpu_adam_trailing_overhead:
+        cpu_adam_trailing_start_event = torch.cuda.Event(enable_timing=True)
+        cpu_adam_trailing_end_event = torch.cuda.Event(enable_timing=True)
+        cpu_adam_trailing_start_event.record()
+
     for param in gaussians.all_parameters():
         if param.grad is not None:
             param.grad /= args.bsz
@@ -4894,6 +5029,13 @@ def fairBraindead_offload_impl(
         else:
             gaussians.optimizer.step()
     gaussians.optimizer.zero_grad(set_to_none=True)
+    if args.log_cpu_adam_trailing_overhead:
+        cpu_adam_trailing_end_event.record()
+        torch.cuda.synchronize()
+        args.cpu_adam_trailing_overhead["step"] += 1
+        if args.cpu_adam_trailing_overhead["step"] > 3:
+            args.cpu_adam_trailing_overhead["from_default_stream"] += cpu_adam_trailing_start_event.elapsed_time(cpu_adam_trailing_end_event)
+
     timers.stop("grad scale + optimizer step + zero grad")
     torch.cuda.synchronize()  
 
@@ -5507,9 +5649,11 @@ def baseline_accumGrads_impl(
 
     return losses, visibility
 
+import gc
 def training(dataset_args, opt_args, pipe_args, args, log_file):
 
     # Init auxiliary tools
+    gc.disable()
 
     torch.cuda.set_device(args.gpu)
     timers = Timer(args)
@@ -6454,6 +6598,22 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     
     parameters = gaussians._parameters[::5000].cpu().detach().numpy().tolist()
     json.dump(parameters, open(os.path.join(args.model_path, "shs_parameters.json"), "w"))
+
+    if args.log_cpu_adam_trailing_overhead:
+        average_cpu_adam_trailing_from_default_stream = (
+            args.cpu_adam_trailing_overhead["from_default_stream"] / (args.cpu_adam_trailing_overhead["step"] - 3)
+        )
+        average_cpu_adam_trailing_from_comm_stream = (
+            args.cpu_adam_trailing_overhead["from_comm_stream"] / (args.cpu_adam_trailing_overhead["step"] - 3)
+        )
+
+        log_file.write(
+            "CPU Adam trailing [from default stream]: {} ms.\n".format(average_cpu_adam_trailing_from_default_stream)
+        )
+        log_file.write(
+            "CPU Adam trailing [from comm stream]: {} ms.\n".format(average_cpu_adam_trailing_from_comm_stream)
+        )
+        # print("CPU Adam trailing overhead: {} ms.".format(average_cpu_adam_trailing_overhead))
 
 
 

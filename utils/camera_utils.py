@@ -286,7 +286,37 @@ def cameraList_from_camInfos(cam_infos, args):
     if utils.DEFAULT_GROUP.size() > 1:
         torch.distributed.barrier(group=utils.DEFAULT_GROUP)
 
+    # camera_list = update_camera_list_with_spatial_position(camera_list)
+
     return camera_list
+
+# def update_camera_list_with_spatial_position(camera_list):
+#     min_x, min_y, min_z = 1e10, 1e10, 1e10
+#     max_x, max_y, max_z = -1e10, -1e10, -1e10
+#     for cam in camera_list:
+#         # use cam.camera_center_cpu to update min and max
+#         x, y, z = cam.camera_center_cpu
+#         min_x = min(min_x, x)
+#         min_y = min(min_y, y)
+#         min_z = min(min_z, z)
+#         max_x = max(max_x, x)
+#         max_y = max(max_y, y)
+#         max_z = max(max_z, z)
+    
+#     # find the longest dimension k
+#     k = max(max_x - min_x, max_y - min_y, max_z - min_z)
+#     if k == max_x - min_x:
+#         k = 0
+#     elif k == max_y - min_y:
+#         k = 1
+#     else:
+#         k = 2
+    
+#     # update camera_list with spatial position
+#     for cam in camera_list:
+#         cam.key_dim = k
+    
+#     return camera_list
 
 
 def camera_to_JSON(id, camera: Camera):

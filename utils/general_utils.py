@@ -352,12 +352,15 @@ def memory_report(prefix):
 def check_memory_usage(log_file, args, iteration, gaussians, before_densification_stop):
     global DEFAULT_GROUP
 
+    p = psutil.Process()
+
     memory_usage = torch.cuda.memory_allocated() / 1024 / 1024 / 1024
     max_memory_usage = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024
     max_reserved_memory = torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024
     now_reserved_memory = torch.cuda.memory_reserved() / 1024 / 1024 / 1024
+    now_pinned_memory = p.memory_info().shared / 1024 / 1024 / 1024
     log_str = ""
-    log_str += "iteration[{},{}) {}Now num of 3dgs: {}. Now Memory usage: {} GB. Max Memory usage: {} GB. Max Reserved Memory: {} GB. Now Reserved Memory: {} GB. \n".format(
+    log_str += "iteration[{},{}) {}Now num of 3dgs: {}. Now Memory usage: {} GB. Max Memory usage: {} GB. Max Reserved Memory: {} GB. Now Reserved Memory: {} GB. Now Pinned Memory: {} GB\n".format(
         iteration,
         iteration + args.bsz,
         "densify_and_prune. " if not before_densification_stop else "",
@@ -366,6 +369,7 @@ def check_memory_usage(log_file, args, iteration, gaussians, before_densificatio
         max_memory_usage,
         max_reserved_memory,
         now_reserved_memory,
+        now_pinned_memory,
     )
     if args.log_memory_summary:
         log_str += "Memory Summary: {} GB \n".format(torch.cuda.memory_summary())
