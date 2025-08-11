@@ -1758,8 +1758,14 @@ class GaussianModel:
                 _features_rest = _features_rest.permute(0, 2, 1).reshape(N, -1)
 
             if self.args.gpu_cache == "xyzosr":
-                self.parameters_buffer = torch.empty((self.args.prealloc_capacity, 48), dtype=torch.float, pin_memory=True)
-                self.parameters_grad_buffer = torch.zeros((self.args.prealloc_capacity, 48), dtype=torch.float, pin_memory=True)
+                parameters_buffer_array = numba.cuda.pinned_array((self.args.prealloc_capacity, 48), dtype=np.float32)
+                self.parameters_buffer = torch.from_numpy(parameters_buffer_array)
+                parameters_grad_buffer_array = numba.cuda.pinned_array((self.args.prealloc_capacity, 48), dtype=np.float32)
+                self.parameters_grad_buffer = torch.from_numpy(parameters_grad_buffer_array)
+                assert self.parameters_buffer.is_pinned()
+                assert self.parameters_grad_buffer.is_pinned()
+                # self.parameters_buffer = torch.empty((self.args.prealloc_capacity, 48), dtype=torch.float, pin_memory=True)
+                # self.parameters_grad_buffer = torch.zeros((self.args.prealloc_capacity, 48), dtype=torch.float, pin_memory=True)
 
                 self.parameters_buffer[:N] = torch.cat((_features_dc, _features_rest), dim=1)
 
