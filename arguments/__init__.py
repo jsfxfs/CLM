@@ -172,7 +172,6 @@ class DistributionParams(ParamGroup):
         self.no_heuristics_update = False
         self.border_divpos_coeff = 1.0
         self.adjust_strategy_warmp_iterations = -1
-        self.save_strategy_history = False
 
         # Distribution for 3DGS-wise workloads.
         self.gaussians_distribution = True

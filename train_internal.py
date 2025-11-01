@@ -9,17 +9,10 @@ from gaussian_renderer import (
 from torch.cuda import nvtx
 from torch.utils.data import DataLoader
 from scene import Scene, GaussianModel, SceneDataset, TorchSceneDataset, custom_collate_fn
-from gaussian_renderer.workload_division import (
-    start_strategy_final,
-    finish_strategy_final,
-    DivisionStrategyHistoryFinal,
-)
-from gaussian_renderer.loss_distribution import (
-    load_camera_from_cpu_to_all_gpu,
-    load_camera_from_cpu_to_all_gpu_for_eval,
-    batched_loss_computation,
-    torch_compiled_loss
-)
+# from gaussian_renderer.loss_distribution import (
+#     batched_loss_computation,
+#     torch_compiled_loss
+# )
 from utils.general_utils import prepare_output_and_logger, globally_sync_for_timer
 import utils.general_utils as utils
 from utils.timer import Timer, End2endTimer
@@ -33,16 +26,10 @@ from densification import (
     update_densification_stats_baseline_accumGrads,
 )
 from diff_gaussian_rasterization import (
-    send2cpu,
-    send2cpu_cat_buffer,
-    send2cpu_cat_buffer_osr_shs,
-    send_shs2cpu_shs_buffer,
     send_shs2gpu_stream,
     send_shs2cpu_grad_buffer_stream,
     send_shs2gpu_stream_retention,
     send_shs2cpu_grad_buffer_stream_retention,
-    send_shs2gpu_stream_retention2_64,
-    send_shs2cpu_grad_buffer_stream_retention2_64,
 )
 import diff_gaussian_rasterization
 import torch.multiprocessing
@@ -61,6 +48,32 @@ from functools import reduce
 import fast_tsp
 from scene.cameras import get_space_sort_key_dim
 import gc
+from fused_ssim import fused_ssim
+
+@torch.compile
+def loss_combined(image, image_gt, ssim_loss):
+    lambda_dssim = 0.2 # TODO: allow this to be set by the user
+    Ll1 = l1_loss(image, image_gt)
+    loss = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (
+                1.0 - ssim_loss
+            )
+    return loss
+
+class FusedCompiledLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, image, image_gt_original):
+        image_gt = torch.clamp(image_gt_original / 255.0, 0.0, 1.0)
+        ssim_loss = fused_ssim(image.unsqueeze(0), image_gt.unsqueeze(0))
+        return loss_combined(image, image_gt, ssim_loss)
+
+FUSED_COMPILED_LOSS_MODULE = FusedCompiledLoss()
+
+def torch_compiled_loss(image, image_gt_original):
+    global FUSED_COMPILED_LOSS_MODULE
+    loss = FUSED_COMPILED_LOSS_MODULE(image, image_gt_original)
+    return loss
 
 def calculate_filters(
     batched_cameras,
@@ -1308,11 +1321,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         args.adjust_strategy_warmp_iterations = train_dataset.camera_size
         # use one epoch to warm up. do not use the first epoch's running time for adjustment of strategy.
 
-    # Init distribution strategy history
-    strategy_history = DivisionStrategyHistoryFinal(
-        train_dataset, utils.DEFAULT_GROUP.size(), utils.DEFAULT_GROUP.rank()
-    )
-
     # Init background
     background = None
     bg_color = [1, 1, 1] if dataset_args.white_background else None
@@ -1440,18 +1448,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     camera.camtoworlds = wvt.unsqueeze(0)
 
         with torch.no_grad():
-            # Prepare Workload division strategy
-            timers.start("prepare_strategies")
-            batched_strategies, gpuid2tasks = start_strategy_final( # TODO: delete this. 
-                batched_cameras, strategy_history
-            )
-            timers.stop("prepare_strategies")
-
             # Load ground-truth images to GPU
             timers.start("load_cameras")
-            load_camera_from_cpu_to_all_gpu(
-                batched_cameras, batched_strategies, gpuid2tasks
-            )
+            for camera in batched_cameras:
+                camera.original_image = camera.original_image_backup.cuda()
             timers.stop("load_cameras")
         if args.braindeath_offload:
             N = gaussians._xyz.shape[0]
@@ -1597,17 +1597,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     else:
                         scene.save(iteration)
 
-                    if args.save_strategy_history:
-                        with open(
-                            args.log_folder
-                            + "/strategy_history_ws="
-                            + str(utils.WORLD_SIZE)
-                            + "_rk="
-                            + str(utils.GLOBAL_RANK)
-                            + ".json",
-                            "w",
-                        ) as f:
-                            json.dump(strategy_history.to_json(), f)
 
                 end2end_timers.start()
                 # utils.memory_report("after densification")
@@ -1783,22 +1772,17 @@ def training_report(
                 # TODO: if not divisible by world size
                 num_cameras = config["num_cameras"]
                 eval_dataset = SceneDataset(config["cameras"])
-                strategy_history = DivisionStrategyHistoryFinal(
-                    eval_dataset, utils.DEFAULT_GROUP.size(), utils.DEFAULT_GROUP.rank()
-                )
                 for idx in range(1, num_cameras + 1, 1):
                     num_camera_to_load = min(1, num_cameras - idx + 1)
                     batched_cameras = eval_dataset.get_batched_cameras(
                         num_camera_to_load
                     )
-                    batched_strategies, gpuid2tasks = start_strategy_final(
-                        batched_cameras, strategy_history
-                    )
-                    load_camera_from_cpu_to_all_gpu_for_eval(
-                        batched_cameras, batched_strategies, gpuid2tasks
-                    )
+                    # Load ground-truth images to GPU
+                    for camera in batched_cameras:
+                        camera.original_image = camera.original_image_backup.cuda()
+                    
                     batched_image = []
-                    for cam_id, (camera, strategy) in enumerate(zip(batched_cameras, batched_strategies)):
+                    for cam_id, camera in enumerate(batched_cameras):
                         #FIXME: quick workaround for verifying the correctness
                         camera.world_view_transform = camera.world_view_transform.cuda()
                         camera.full_proj_transform = camera.full_proj_transform.cuda()
@@ -1871,9 +1855,6 @@ def training_report(
                 # TODO: if not divisible by world size
                 num_cameras = config["num_cameras"]
                 eval_dataset = TorchSceneDataset(config["cameras"], config["cameras_info"])
-                strategy_history = DivisionStrategyHistoryFinal(
-                    eval_dataset, utils.DEFAULT_GROUP.size(), utils.DEFAULT_GROUP.rank()
-                )
                 # Init dataloader: num_workers = 0
                 dataloader = DataLoader(
                     eval_dataset,
@@ -1895,14 +1876,12 @@ def training_report(
                     # batched_cameras = eval_dataset.get_batched_cameras(
                     #     num_camera_to_load
                     # )
-                    batched_strategies, gpuid2tasks = start_strategy_final(
-                        batched_cameras, strategy_history
-                    )
-                    load_camera_from_cpu_to_all_gpu_for_eval(
-                        batched_cameras, batched_strategies, gpuid2tasks
-                    )
+                    # Load ground-truth images to GPU
+                    for camera in batched_cameras:
+                        camera.original_image = camera.original_image_backup.cuda()
+                    
                     batched_image = []
-                    for cam_id, (camera, strategy) in enumerate(zip(batched_cameras, batched_strategies)):
+                    for cam_id, camera in enumerate(batched_cameras):
                         #FIXME: quick workaround for verifying the correctness
                         camera.world_view_transform = camera.world_view_transform.cuda()
                         camera.full_proj_transform = camera.full_proj_transform.cuda()
@@ -1930,23 +1909,7 @@ def training_report(
                             )
                             batched_image.append(rendered_image)
                         else:
-                            batched_screenspace_pkg = (
-                                gsplat_distributed_preprocess3dgs_and_all2all_final(
-                                    [camera],
-                                    scene.gaussians,
-                                    pipe_args,
-                                    background,
-                                    batched_strategies=[strategy],
-                                    mode="test",
-                                    offload=False,
-                                )
-                            )
-                            images, _ = gsplat_render_final(
-                                batched_screenspace_pkg, [strategy]
-                            )
-                            
-                            batched_image.append(images[0])
-                            del batched_screenspace_pkg
+                            raise ValueError("Invalid offload value")
 
 
                     for camera_id, (image, gt_camera) in enumerate(
