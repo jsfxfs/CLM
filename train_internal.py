@@ -1536,7 +1536,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 )
                 log_file.write(log_string)
 
-        elif args.accumulate_grads:
+        else:
             raise ValueError("Accumulate grads is not supported")
 
         with torch.no_grad():
@@ -1559,8 +1559,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 gsplat_densification(
                     iteration, scene, gaussians, batched_screenspace_pkg, offload=args.offload, densify_only=True
                 )
-            elif args.accumulate_grads:
-                raise ValueError("Accumulate grads is not supported")
             else:  
                 raise ValueError("Invalid offload value")
             if not args.disable_auto_densification and iteration <= args.densify_until_iter and iteration > args.densify_from_iter and utils.check_update_at_this_iter(
