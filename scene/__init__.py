@@ -127,18 +127,6 @@ class Scene:
         
         # Preprocess dataset
         # Train on original resolution, no downsampling in our implementation.
-        assert not (args.decode_dataset_to_disk and args.preload_dataset_to_gpu_threshold > 0), "Can not preload dataset to gpu and offload it to disk at the same time. Disable `decode_dataset_to_disk` or reset `preload_dataset_to_gpu_threshold`."
-        if (
-            dataset_size_in_GB < args.preload_dataset_to_gpu_threshold
-        ):  # 10GB memory limit for dataset
-            log_file.write(
-                f"[NOTE]: Preloading dataset({dataset_size_in_GB}GB) to GPU. Disable distributed_dataset_storage.\n"
-            )
-            print(
-                f"[NOTE]: Preloading dataset({dataset_size_in_GB}GB) to GPU. Disable distributed_dataset_storage."
-            )
-            args.preload_dataset_to_gpu = True
-            args.distributed_dataset_storage = False
 
         if args.decode_dataset_to_disk:
             # Predecode dataset as raw files to local disk

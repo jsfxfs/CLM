@@ -76,7 +76,6 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
         self.device = "cpu" if args.offload and args.gpu_cache == "no_cache" else "cuda"
-        self.mxw_debug = args.mxw_debug
 
     def capture(self):
         assert False, "optimizer not fixed yet"

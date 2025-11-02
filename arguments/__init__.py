@@ -162,12 +162,6 @@ class OptimizationParams(ParamGroup):
 
         # Dataset and Model save
         self.bsz = 1  # batch size.
-        self.preload_dataset_to_gpu = (
-            False  # By default, we do not preload dataset to GPU.
-        )
-        self.preload_dataset_to_gpu_threshold = (
-            10  # unit is GB, by default 10GB memory limit for dataset.
-        )
         self.multiprocesses_image_loading = False # Disable multiprocess image loading by default to avoid out of shared memory
         self.num_train_cameras = -1
         self.num_test_cameras = -1
@@ -183,7 +177,6 @@ class BenchmarkParams(ParamGroup):
     def __init__(self, parser):
         self.enable_timer = False  # Log running time from python side.
         self.end2end_time = True  # Log end2end training time.
-        self.zhx_time = False  # Log running time from gpu side.
         self.check_gpu_memory = False  # check gpu memory usage.
         self.check_cpu_memory = False  # check cpu memory usage.
         self.log_memory_summary = False

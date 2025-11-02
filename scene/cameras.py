@@ -67,8 +67,6 @@ class Camera(nn.Module):
         # Single GPU mode - always load
         # load to cpu
         self.original_image_backup = image.contiguous()
-        if args.preload_dataset_to_gpu:
-            self.original_image_backup = self.original_image_backup.to("cuda")
         self.image_width = self.original_image_backup.shape[2]
         self.image_height = self.original_image_backup.shape[1]
 
