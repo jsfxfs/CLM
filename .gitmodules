@@ -14,7 +14,6 @@
 [submodule "submodules/fast-tsp"]
 	path = submodules/fast-tsp
 	url = git@github.com:TarzanZhao/fast-tsp.git
-[submodule "submodules/diff-gaussian-rasterization"]
-	path = submodules/diff-gaussian-rasterization
-	url = git@github.com:nyu-systems/diff-gaussian-rasterization.git
-    branch = xiwen
+[submodule "submodules/clm_kernels"]
+	path = submodules/clm_kernels
+	url = git@github.com:TarzanZhao/clm_kernels.git

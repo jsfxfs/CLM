@@ -15,13 +15,13 @@ from densification import (
     update_densification_stats_pipelineoffload_xyzosr,
     update_densification_stats_baseline_accumGrads,
 )
-from diff_gaussian_rasterization import (
+from clm_kernels import (
     send_shs2gpu_stream,
     send_shs2cpu_grad_buffer_stream,
     send_shs2gpu_stream_retention,
     send_shs2cpu_grad_buffer_stream_retention,
 )
-import diff_gaussian_rasterization
+import clm_kernels
 import torch.multiprocessing
 import gc
 import math
@@ -403,7 +403,7 @@ def pipeline_offload_retention_optimized_v5_impl(
                 gs_bitmap = torch.zeros((n_gaussians), dtype=dtype, device="cuda")
                 # Encode bitmap: MSB->first microbatch; LSB->last microbatch
                 for i, f in enumerate(filters):
-                    diff_gaussian_rasterization._C.scatter_to_bit(gs_bitmap, f, bsz-1-i)
+                    clm_kernels.scatter_to_bit(gs_bitmap, f, bsz-1-i)
     
                 torch.cuda.nvtx.range_pop()
 
@@ -443,10 +443,10 @@ def pipeline_offload_retention_optimized_v5_impl(
                 # Re-encode the bitmap based on given order
                 gs_bitmap.zero_()
                 for i, f in enumerate(filters):
-                    diff_gaussian_rasterization._C.scatter_to_bit(gs_bitmap, f, bsz-1-i)
+                    clm_kernels.scatter_to_bit(gs_bitmap, f, bsz-1-i)
 
                 ffs = torch.empty(n_gaussians, dtype=torch.uint8, device="cuda")
-                diff_gaussian_rasterization._C.extract_ffs(gs_bitmap, ffs)
+                clm_kernels.extract_ffs(gs_bitmap, ffs)
                 sorted_ffs, indices = torch.sort(ffs)
                 elems, counts = torch.unique_consecutive(sorted_ffs, return_counts=True)
                 update_ls = torch.split(indices, counts.tolist(), dim=0)
@@ -468,7 +468,7 @@ def pipeline_offload_retention_optimized_v5_impl(
                 torch.cuda.nvtx.range_push("precompute sums")
                 ps_grid_size, ps_blk_size = (64, 256)
                 tmp_buffer = torch.empty((bsz-1, ps_grid_size * ps_blk_size), dtype=torch.int, device="cuda") # 31 * #t
-                diff_gaussian_rasterization._C.compute_cnt_h(gs_bitmap, tmp_buffer, ps_grid_size, ps_blk_size)
+                clm_kernels.compute_cnt_h(gs_bitmap, tmp_buffer, ps_grid_size, ps_blk_size)
                 cnt_d = torch.sum(tmp_buffer, dim=1).flatten()
                 filter_len = torch.tensor([len(f) for f in filters], device="cuda")
                 cnt_h = filter_len[1:] - cnt_d
@@ -777,7 +777,7 @@ def pipeline_offload_retention_optimized_v5_impl(
                     if args.overlap_cpuadam:
                         if args.overlap_cpuadam_version == 3:
                             # set signal to pinned memory to notify gradients have been sent back to cpu
-                            diff_gaussian_rasterization._C.set_signal(signal_tensor_pinned, microbatch_idx, 1)
+                            clm_kernels.set_signal(signal_tensor_pinned, microbatch_idx, 1)
                             microbatch_idx += 1
                     
             else:
@@ -795,7 +795,7 @@ def pipeline_offload_retention_optimized_v5_impl(
                     if args.overlap_cpuadam:
                         if args.overlap_cpuadam_version == 3:
                             # set signal to pinned memory to notify gradients have been sent back to cpu
-                            diff_gaussian_rasterization._C.set_signal(signal_tensor_pinned, microbatch_idx, 1)
+                            clm_kernels.set_signal(signal_tensor_pinned, microbatch_idx, 1)
                             microbatch_idx += 1
 
         torch.cuda.nvtx.range_pop()

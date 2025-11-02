@@ -13,7 +13,6 @@ from argparse import ArgumentParser, Namespace
 import sys
 import os
 import utils.general_utils as utils
-import diff_gaussian_rasterization
 
 
 class GroupParams:
@@ -254,17 +253,6 @@ def print_all_args(args, log_file):
         log_file.write("{}: {}\n".format(arg, getattr(args, arg)))
     log_file.write("-" * 30 + "\n\n")
     log_file.write("bsz: " + str(args.bsz) + "\n")
-
-    # Make sure block size match between python and cuda code.
-    cuda_block_x, cuda_block_y, one_dim_block_size = (
-        diff_gaussian_rasterization._C.get_block_XY()
-    )
-    utils.set_block_size(cuda_block_x, cuda_block_y, one_dim_block_size)
-    log_file.write(
-        "cuda_block_x: {}; cuda_block_y: {}; one_dim_block_size: {};\n".format(
-            cuda_block_x, cuda_block_y, one_dim_block_size
-        )
-    )
 
 
 def find_latest_checkpoint(log_folder):
