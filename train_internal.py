@@ -38,7 +38,7 @@ from functools import reduce
 import fast_tsp
 from scene.cameras import get_space_sort_key_dim
 import gc
-from fused_ssim import fused_ssim
+from clm_kernels import fused_ssim
 
 @torch.compile
 def loss_combined(image, image_gt, ssim_loss):
