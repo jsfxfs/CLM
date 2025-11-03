@@ -127,121 +127,6 @@ def calculate_filters(
     filters = gaussian_ids_per_camera # on GPU
     return filters, camera_ids, gaussian_ids
 
-
-def pipeline_forward_one_step(
-    filtered_opacity_gpu,
-    filtered_scaling_gpu,
-    filtered_rotation_gpu,
-    filtered_xyz_gpu,
-    filtered_shs,
-    camera,
-    scene,
-    gaussians,
-    background,
-    pipe_args,
-    eval=False,
-):
-    # print shape of all inputs
-    # print("filtered_opacity_gpu shape: ", filtered_opacity_gpu.shape)
-    # print("filtered_scaling_gpu shape: ", filtered_scaling_gpu.shape)
-    # print("filtered_rotation_gpu shape: ", filtered_rotation_gpu.shape)
-    # print("filtered_xyz_gpu shape: ", filtered_xyz_gpu.shape)
-    # print("filtered_shs shape: ", filtered_shs.shape)
-
-    viewmat = camera.world_view_transform.transpose(0, 1)  # why transpose
-    # K = camera.create_k_on_gpu() # create K now, which may invoke cpu-gpu transfer
-    K = camera.K
-    n_selected = filtered_xyz_gpu.shape[0]
-    image_width = int(utils.get_img_width())
-    image_height = int(utils.get_img_height())
-    tile_size = 16
-    B = 1 # micro batch size is just 1
-
-    batched_radiis, batched_means2D, batched_depths, batched_conics, _ = (
-        fully_fused_projection(
-            means=filtered_xyz_gpu, # (N, 3)
-            covars=None,
-            quats=filtered_rotation_gpu,
-            scales=filtered_scaling_gpu,
-            viewmats=viewmat.unsqueeze(0),
-            Ks=K.unsqueeze(0),
-            width=image_width,
-            height=image_height,
-            packed=False,
-        )
-    ) # (1, N), (1, N, 2), (1, N), (1, N, 3), (1, N)
-
-    if not eval:
-        batched_means2D.retain_grad() # this is only for training. 
-
-    sh_degree = gaussians.active_sh_degree
-    camtoworlds = camera.camtoworlds
-    # camtoworlds = torch.inverse(viewmat.unsqueeze(0)) # (4, 4)
-    dirs = filtered_xyz_gpu[None, :, :] - camtoworlds[:, None, :3, 3]
-    filtered_shs = filtered_shs.reshape(1, n_selected, 16, 3)
-    batched_colors = spherical_harmonics(
-        degrees_to_use=sh_degree, dirs=dirs, coeffs=filtered_shs
-    )
-    batched_colors = torch.clamp_min(batched_colors + 0.5, 0.0) # (1, N, 3)
-    batched_opacities = filtered_opacity_gpu.squeeze(1).unsqueeze(0) # (N, 1) -> (1, N)
-
-    # NOTE: In the above code, we keep the first batch dimension, even if it is always 1. 
-
-    # render
-    # Identify intersecting tiles.
-    tile_width = math.ceil(image_width / float(tile_size))
-    tile_height = math.ceil(image_height / float(tile_size))
-
-    # flatten_ids: (C*N)
-    _, isect_ids, flatten_ids = isect_tiles(
-        means2d=batched_means2D,
-        radii=batched_radiis,
-        depths=batched_depths,
-        tile_size=tile_size,
-        tile_width=tile_width,
-        tile_height=tile_height,
-        packed=False,
-    )
-    isect_offsets = isect_offset_encode(
-        isect_ids, B, tile_width, tile_height
-    )  # (B, tile_height, tile_width)
-
-    # no need for now
-    # global max_num_intersection
-    # num_intersection = isect_ids.shape[0]
-    # max_num_intersection = max(max_num_intersection, num_intersection)    
-    # args = utils.get_args()
-    # iteration = utils.get_cur_iter()
-    # log_file = utils.get_log_file()
-    # if (iteration % args.log_interval) == 1:
-    #     log_file.write(
-    #         "<<< # iteration: {}, # intersections = {}, max # intersections = {} >>>\n".format(iteration, num_intersection, max_num_intersection)
-    #     )
-
-    # TODO: One way to do load balancing: Add two timer operators before and after `rasterize_to_pixels`
-    # record_time_start : torch operator(torch.autograd.func)
-
-    # Rasterize to pixels. batched_rendered_image: (B, image_height, image_width, 3)
-    backgrounds = (
-        background.repeat(B, 1) if background is not None else None
-    )
-    rendered_image, _ = rasterize_to_pixels(
-        means2d=batched_means2D,
-        conics=batched_conics,
-        colors=batched_colors,
-        opacities=batched_opacities,
-        image_width=image_width,
-        image_height=image_height,
-        tile_size=tile_size,
-        isect_offsets=isect_offsets,
-        flatten_ids=flatten_ids,
-        backgrounds=backgrounds,
-    )
-
-    rendered_image = rendered_image.squeeze(0).permute(2, 0, 1).contiguous()
-
-    return rendered_image, batched_means2D, batched_radiis
-
 def pipeline_forward_one_step_shs_inplace(
     filtered_opacity_gpu,
     filtered_scaling_gpu,
@@ -1098,7 +983,7 @@ def fairBraindead_offload_impl(
 
     return losses, visibility
 
-def pipeline_forward_one_step( # FIXME: why there are two pipeline_forward_one_step? 
+def pipeline_forward_one_step(
     filtered_opacity_gpu,
     filtered_scaling_gpu,
     filtered_rotation_gpu,
