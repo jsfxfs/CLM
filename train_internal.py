@@ -240,8 +240,6 @@ def pipeline_offload_retention_optimized_v5_impl(
     iteration = utils.get_cur_iter()
     log_file = utils.get_log_file()
 
-    assert not args.offload_shs_grad_before_every_microbatch, "retention 4 currently requires disable offload_shs_grad_before_every_microbatc"
-
     bsz = len(batched_cameras)
     n_gaussians = gaussians._xyz.shape[0]
 
@@ -611,63 +609,63 @@ def pipeline_offload_retention_optimized_v5_impl(
         gpu2cpu_event = torch.cuda.Event(enable_timing=True)
         gpu2cpu_event.record(default_stream)
 
-        if not args.offload_shs_grad_before_every_microbatch:
-            if micro_idx < num_micro_batches - 1:
-                with torch.cuda.stream(comm_stream), torch.no_grad():
-                    # compute indices on the fly
 
-                    rtnt_indices_from_grad = param_indices_from_rtnt
-                    grad_indices_to_rtnt = rtnt_indices_to_param
+        if micro_idx < num_micro_batches - 1:
+            with torch.cuda.stream(comm_stream), torch.no_grad():
+                # compute indices on the fly
 
-                    # idx_g = torch.nonzero(this_bit & ~next_bit).flatten() # torch.nonzero() blocks cpu!!!
-                    bit_g = this_bit & ~next_bit
-                    idx_g = torch.nonzero_static(bit_g, size=cnt_g[micro_idx]).flatten()
+                rtnt_indices_from_grad = param_indices_from_rtnt
+                grad_indices_to_rtnt = rtnt_indices_to_param
 
-                    host_indices_from_grad = idx_g.to(torch.int32)
-                    grad_indices_to_host = torch.gather(retention_vec, dim=0, index=idx_g)
-                    del idx_g, bit_g
+                # idx_g = torch.nonzero(this_bit & ~next_bit).flatten() # torch.nonzero() blocks cpu!!!
+                bit_g = this_bit & ~next_bit
+                idx_g = torch.nonzero_static(bit_g, size=cnt_g[micro_idx]).flatten()
 
-                    # sync event of default_stream with comm_stream
-                    gpu2cpu_event.wait(comm_stream)
-                    shs_retents[micro_idx] = None
-                    shs_grad_next = torch.zeros_like(shs_next, device="cuda")
+                host_indices_from_grad = idx_g.to(torch.int32)
+                grad_indices_to_host = torch.gather(retention_vec, dim=0, index=idx_g)
+                del idx_g, bit_g
 
-                    send_shs2cpu_grad_buffer_stream_retention(
-                        shs_grad,
-                        parameters_grad_buffer[:N, :],
-                        shs_grad_next,
-                        host_indices_from_grad,
-                        rtnt_indices_from_grad,
-                        grad_indices_to_host,
-                        grad_indices_to_rtnt,
-                        True,
-                        grid_size,
-                        block_size,
-                        grid_size_D,
-                        block_size_D
-                    )
-                    shs_grad = shs_grad_next
-                    shs_grad_init_event.record(comm_stream)
+                # sync event of default_stream with comm_stream
+                gpu2cpu_event.wait(comm_stream)
+                shs_retents[micro_idx] = None
+                shs_grad_next = torch.zeros_like(shs_next, device="cuda")
 
-                    # set signal to pinned memory to notify gradients have been sent back to cpu
-                    clm_kernels.set_signal(signal_tensor_pinned, microbatch_idx, 1)
-                    microbatch_idx += 1
-                    
-            else:
-                with torch.cuda.stream(comm_stream), torch.no_grad():
-                    gpu2cpu_event.wait(comm_stream)
+                send_shs2cpu_grad_buffer_stream_retention(
+                    shs_grad,
+                    parameters_grad_buffer[:N, :],
+                    shs_grad_next,
+                    host_indices_from_grad,
+                    rtnt_indices_from_grad,
+                    grad_indices_to_host,
+                    grad_indices_to_rtnt,
+                    True,
+                    grid_size,
+                    block_size,
+                    grid_size_D,
+                    block_size_D
+                )
+                shs_grad = shs_grad_next
+                shs_grad_init_event.record(comm_stream)
 
-                    send_shs2cpu_grad_buffer_stream(
-                        shs_grad,
-                        parameters_grad_buffer[:N, :],
-                        filters[-1],
-                        True,
-                        grid_size, block_size
-                    )
-                    
-                    # set signal to pinned memory to notify gradients have been sent back to cpu
-                    clm_kernels.set_signal(signal_tensor_pinned, microbatch_idx, 1)
-                    microbatch_idx += 1
+                # set signal to pinned memory to notify gradients have been sent back to cpu
+                clm_kernels.set_signal(signal_tensor_pinned, microbatch_idx, 1)
+                microbatch_idx += 1
+                
+        else:
+            with torch.cuda.stream(comm_stream), torch.no_grad():
+                gpu2cpu_event.wait(comm_stream)
+
+                send_shs2cpu_grad_buffer_stream(
+                    shs_grad,
+                    parameters_grad_buffer[:N, :],
+                    filters[-1],
+                    True,
+                    grid_size, block_size
+                )
+                
+                # set signal to pinned memory to notify gradients have been sent back to cpu
+                clm_kernels.set_signal(signal_tensor_pinned, microbatch_idx, 1)
+                microbatch_idx += 1
 
         torch.cuda.nvtx.range_pop()
 

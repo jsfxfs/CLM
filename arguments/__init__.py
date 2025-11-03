@@ -199,7 +199,6 @@ class DebugParams(ParamGroup):
         self.save_tensors = False # Save model parameters as .pt file
 
         self.manual_gc = False
-        self.offload_shs_grad_before_every_microbatch = False
         self.comm_stream_priority = 0
         self.subsample_ratio = 1.0
         self.upsample_ratio = 0.0
