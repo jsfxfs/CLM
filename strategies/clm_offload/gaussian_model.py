@@ -32,7 +32,7 @@ class GaussianModelCLMOffload(BaseGaussianModel):
     def _get_device(self):
         return "cuda"
 
-    def create_from_pcd_offloaded(self, pcd: BasicPointCloud, spatial_lr_scale: float, subsample_ratio=1.0):
+    def create_from_pcd_offloaded(self, pcd: BasicPointCloud, spatial_lr_scale: float):
         log_file = utils.get_log_file()
         self.spatial_lr_scale = spatial_lr_scale
 
@@ -59,21 +59,6 @@ class GaussianModelCLMOffload(BaseGaussianModel):
             0.0000001,
         )
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3).to("cuda")
-
-        if subsample_ratio != 1.0:
-            assert subsample_ratio > 0 and subsample_ratio < 1
-            sub_N = int(N * subsample_ratio)
-            print("Subsample ratio: ", subsample_ratio)
-            print("Number of points after subsampling : ", sub_N)
-
-            perm_generator = torch.Generator()
-            perm_generator.manual_seed(1)
-            subsampled_set_gpu, _ = torch.randperm(N)[:sub_N].sort()
-            subsampled_set_cpu = subsampled_set_gpu.to("cpu")
-            fused_point_cloud = fused_point_cloud[subsampled_set_gpu]
-            features = features[subsampled_set_cpu]
-            scales = scales[subsampled_set_gpu]
-            N = sub_N
 
         rots = torch.zeros((N, 4), device="cuda")
         rots[:, 0] = 1
@@ -239,51 +224,6 @@ class GaussianModelCLMOffload(BaseGaussianModel):
 
         N = _xyz.shape[0]
         print("Number of points before initialization : ", N)
-
-        # Handle upsampling/subsampling
-        if self.args.upsample_ratio != 0.0:
-            assert self.args.subsample_ratio == 1.0, "Can not upsample and subsample at the same time"
-
-            up_N = int(N * self.args.upsample_ratio)
-            print("Upsample ratio: ", self.args.upsample_ratio)
-
-            perm_generator = torch.Generator()
-            perm_generator.manual_seed(1)
-            upsampled_set_cpu, _ = torch.randperm(N)[:(up_N % N)].sort()
-
-            _xyz_up = torch.cat([_xyz] * (up_N // N) + [_xyz[upsampled_set_cpu]])
-            _opacity_up = torch.cat([_opacity] * (up_N // N) + [_opacity[upsampled_set_cpu]])
-            _scaling_up = torch.cat([_scaling] * (up_N // N) + [_scaling[upsampled_set_cpu]])
-            _rotation_up = torch.cat([_rotation] * (up_N // N) + [_rotation[upsampled_set_cpu]])
-            _features_up = torch.cat([_features] * (up_N // N) + [_features[upsampled_set_cpu]])
-
-            scaling_up = torch.exp(_scaling_up)
-            noise = (torch.rand_like(_xyz_up) + 0.5) * torch.clamp(scaling_up, max=30)
-            _xyz_up.add_(noise)
-            _xyz = torch.cat((_xyz, _xyz_up))
-            _opacity = torch.cat((_opacity, _opacity_up))
-            _scaling = torch.cat((_scaling, _scaling_up))
-            _rotation = torch.cat((_rotation, _rotation_up))
-            _features = torch.cat((_features, _features_up))
-            N = N + up_N
-            print("Number of points after upsampling : ", _xyz.shape[0])
-
-        elif self.args.subsample_ratio != 1.0:
-            assert self.args.subsample_ratio > 0 and self.args.subsample_ratio < 1
-            sub_N = int(N * self.args.subsample_ratio)
-            print("Subsample ratio: ", self.args.subsample_ratio)
-            print("Number of points after subsampling : ", sub_N)
-
-            perm_generator = torch.Generator()
-            perm_generator.manual_seed(1)
-            subsampled_set_cpu, _ = torch.randperm(N)[:sub_N].sort()
-
-            _xyz = _xyz[subsampled_set_cpu]
-            _opacity = _opacity[subsampled_set_cpu]
-            _scaling = _scaling[subsampled_set_cpu]
-            _rotation = _rotation[subsampled_set_cpu]
-            _features = _features[subsampled_set_cpu]
-            N = sub_N
 
         # Allocate pinned buffer
         parameters_buffer_array = numba.cuda.pinned_array((self.args.prealloc_capacity, 48), dtype=np.float32)
@@ -524,54 +464,6 @@ class GaussianModelCLMOffload(BaseGaussianModel):
         _rotation = torch.from_numpy(rots)
         _features_dc = torch.from_numpy(features_dc)
         _features_rest = torch.from_numpy(features_extra)
-
-        if self.args.upsample_ratio != 0.0:
-            assert self.args.subsample_ratio == 1.0, "Can not upsample and subsample at the same time"
-
-            up_N = int(N * self.args.upsample_ratio)
-            print("Upsample ratio: ", self.args.upsample_ratio)
-
-            perm_generator = torch.Generator()
-            perm_generator.manual_seed(1)
-            upsampled_set_cpu, _ = torch.randperm(N)[:(up_N % N)].sort()
-
-            _xyz_up = torch.cat([_xyz] * (up_N // N) + [_xyz[upsampled_set_cpu]])
-            _opacity_up = torch.cat([_opacity] * (up_N // N) + [_opacity[upsampled_set_cpu]])
-            _scaling_up = torch.cat([_scaling] * (up_N // N) + [_scaling[upsampled_set_cpu]])
-            _rotation_up = torch.cat([_rotation] * (up_N // N) + [_rotation[upsampled_set_cpu]])
-            _features_dc_up = torch.cat([_features_dc] * (up_N // N) + [_features_dc[upsampled_set_cpu]])
-            _features_rest_up = torch.cat([_features_rest] * (up_N // N) + [_features_rest[upsampled_set_cpu]])
-
-            s = torch.exp(_scaling_up) # just for noise generation. not affecting `_scaling_up`.
-            noise = (torch.rand_like(_xyz_up) + 0.5) * torch.clamp(s, max=30)
-            _xyz_up.add_(noise)
-            _xyz = torch.cat((_xyz, _xyz_up))
-            _opacity = torch.cat((_opacity, _opacity_up))
-            _scaling = torch.cat((_scaling, _scaling_up))
-            _rotation = torch.cat((_rotation, _rotation_up))
-            _features_dc = torch.cat((_features_dc, _features_dc_up))
-            _features_rest = torch.cat((_features_rest, _features_rest_up))
-            N = N + up_N
-            print("Number of points after upsampling : ", _xyz.shape[0])
-
-        elif self.args.subsample_ratio != 1.0:
-            assert self.args.subsample_ratio > 0 and self.args.subsample_ratio < 1
-            sub_N = int(N * self.args.subsample_ratio)
-            print("Subsample ratio: ", self.args.subsample_ratio)
-            print("Number of points after subsampling : ", sub_N)
-
-            perm_generator = torch.Generator()
-            perm_generator.manual_seed(1)
-            subsampled_set_cpu, _ = torch.randperm(N)[:sub_N].sort()
-
-            _xyz = _xyz[subsampled_set_cpu]
-            _opacity = _opacity[subsampled_set_cpu]
-            _scaling = _scaling[subsampled_set_cpu]
-            _rotation = _rotation[subsampled_set_cpu]
-            _features_dc = _features_dc[subsampled_set_cpu]
-            _features_rest = _features_rest[subsampled_set_cpu]
-            N = sub_N
-
 
         self.parameters_buffer = torch.empty(0)
         self.parameters_grad_buffer = torch.zeros(0)

@@ -196,7 +196,7 @@ class Scene:
             self.gaussians.load_ply(args.load_ply_path)
         else:
             # Both model types use create_from_pcd_offloaded
-            self.gaussians.create_from_pcd_offloaded(scene_info.point_cloud, self.cameras_extent, args.subsample_ratio)
+            self.gaussians.create_from_pcd_offloaded(scene_info.point_cloud, self.cameras_extent)
 
         utils.check_initial_gpu_memory_usage("after initializing point cloud")
         utils.log_cpu_memory_usage("after loading initial 3dgs points")

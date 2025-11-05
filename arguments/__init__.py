@@ -246,8 +246,6 @@ class DebugParams(ParamGroup):
         self.reset_each_iter = False # Reset max memory for  each iteration
         self.save_tensors = False # Save model parameters as .pt file
 
-        self.subsample_ratio = 1.0
-        self.upsample_ratio = 0.0
         self.reinit_ply = False
 
         super().__init__(parser, "Debug Parameters")
