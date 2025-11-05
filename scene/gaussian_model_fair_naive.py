@@ -20,6 +20,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 import utils.general_utils as utils
 import cpu_adam
+from utils.system_utils import mkdir_p
 
 from scene.gaussian_model import BaseGaussianModel
 
@@ -76,8 +77,8 @@ class GaussianModelBraindeathOffload(BaseGaussianModel):
         self._rotation = nn.Parameter(rots.pin_memory().requires_grad_(True))
         self._opacity = nn.Parameter(opacities.pin_memory().requires_grad_(True))
 
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.sum_visible_count_in_one_batch = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cpu")
+        self.sum_visible_count_in_one_batch = torch.zeros((self.get_xyz.shape[0]), device="cpu")
 
     def all_parameters(self):
         return [
@@ -91,8 +92,8 @@ class GaussianModelBraindeathOffload(BaseGaussianModel):
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cpu")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cpu")
 
         args = utils.get_args()
         log_file = utils.get_log_file()
@@ -260,7 +261,7 @@ class GaussianModelBraindeathOffload(BaseGaussianModel):
         self._features_dc = nn.Parameter(_features_dc.contiguous().pin_memory().requires_grad_(True))
         self._features_rest = nn.Parameter(_features_rest.contiguous().pin_memory().requires_grad_(True))
 
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cpu")
         self.active_sh_degree = self.max_sh_degree
 
     def save_sub_plys(
@@ -645,107 +646,35 @@ class GaussianModelBraindeathOffload(BaseGaussianModel):
             _features_rest = _features_rest[subsampled_set_cpu]
             N = sub_N
 
-        if self.args.braindeath_offload:
-            self._xyz = nn.Parameter(
-                _xyz.to(torch.float).to("cpu").pin_memory().requires_grad_(True)
-            )
-            self._features_dc = nn.Parameter(
-                _features_dc.to(torch.float).to("cpu")
-                .transpose(1, 2)
-                .contiguous()
-                .pin_memory()
-                .requires_grad_(True)
-            )
-            self._features_rest = nn.Parameter(
-                _features_rest.to(torch.float).to("cpu")
-                .transpose(1, 2)
-                .contiguous()
-                .pin_memory()
-                .requires_grad_(True)
-            )
-            self._opacity = nn.Parameter(
-                _opacity.to(torch.float).to("cpu").pin_memory().requires_grad_(True)
-            )
-            self._scaling = nn.Parameter(
-                _scaling.to(torch.float).to("cpu").pin_memory().requires_grad_(True)
-            )
-            self._rotation = nn.Parameter(
-                _rotation.to(torch.float).to("cpu").pin_memory().requires_grad_(True)
-            )
-            self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self._xyz = nn.Parameter(
+            _xyz.to(torch.float).to("cpu").pin_memory().requires_grad_(True)
+        )
+        self._features_dc = nn.Parameter(
+            _features_dc.to(torch.float).to("cpu")
+            .transpose(1, 2)
+            .contiguous()
+            .pin_memory()
+            .requires_grad_(True)
+        )
+        self._features_rest = nn.Parameter(
+            _features_rest.to(torch.float).to("cpu")
+            .transpose(1, 2)
+            .contiguous()
+            .pin_memory()
+            .requires_grad_(True)
+        )
+        self._opacity = nn.Parameter(
+            _opacity.to(torch.float).to("cpu").pin_memory().requires_grad_(True)
+        )
+        self._scaling = nn.Parameter(
+            _scaling.to(torch.float).to("cpu").pin_memory().requires_grad_(True)
+        )
+        self._rotation = nn.Parameter(
+            _rotation.to(torch.float).to("cpu").pin_memory().requires_grad_(True)
+        )
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cpu")
 
-            self.active_sh_degree = self.max_sh_degree
-
-        elif self.args.offload:
-            self.parameters_buffer = torch.empty(0)
-            self.parameters_grad_buffer = torch.zeros(0)
-
-            if _features_dc.ndim == 3:
-                _features_dc = _features_dc.permute(0, 2, 1).reshape(N, -1)
-            if _features_rest.ndim == 3:
-                _features_rest = _features_rest.permute(0, 2, 1).reshape(N, -1)
-
-            if self.args.gpu_cache == "xyzosr":
-                parameters_buffer_array = numba.cuda.pinned_array((self.args.prealloc_capacity, 48), dtype=np.float32)
-                self.parameters_buffer = torch.from_numpy(parameters_buffer_array)
-                parameters_grad_buffer_array = numba.cuda.pinned_array((self.args.prealloc_capacity, 48), dtype=np.float32)
-                self.parameters_grad_buffer = torch.from_numpy(parameters_grad_buffer_array)
-                assert self.parameters_buffer.is_pinned()
-                assert self.parameters_grad_buffer.is_pinned()
-                # self.parameters_buffer = torch.empty((self.args.prealloc_capacity, 48), dtype=torch.float, pin_memory=True)
-                # self.parameters_grad_buffer = torch.zeros((self.args.prealloc_capacity, 48), dtype=torch.float, pin_memory=True)
-
-                self.parameters_buffer[:N] = torch.cat((_features_dc, _features_rest), dim=1)
-
-                self._parameters = nn.Parameter(
-                    self.parameters_buffer[:N].requires_grad_(True)
-                )
-
-                self._xyz = nn.Parameter(
-                    _xyz.to(torch.float).to(self.device).requires_grad_(True)
-                )
-                self._opacity = nn.Parameter(
-                    _opacity.to(torch.float).to(self.device).requires_grad_(True)
-                )
-                self._scaling = nn.Parameter(
-                    _scaling.to(torch.float).to(self.device).requires_grad_(True)
-                )
-                self._rotation = nn.Parameter(
-                    _rotation.to(torch.float).to(self.device).requires_grad_(True)
-                )
-
-                self.active_sh_degree = self.max_sh_degree
-            
-            else:
-                raise ValueError("Not implemented yet.")
-        
-        else:
-            self._xyz = nn.Parameter(
-                _xyz.to(torch.float).to(self.device).requires_grad_(True)
-            )
-            self._features_dc = nn.Parameter(
-                _features_dc.to(torch.float).to(self.device)
-                .transpose(1, 2)
-                .contiguous()
-                .requires_grad_(True)
-            )
-            self._features_rest = nn.Parameter(
-                _features_rest.to(torch.float).to(self.device)
-                .transpose(1, 2)
-                .contiguous()
-                .requires_grad_(True)
-            )
-            self._opacity = nn.Parameter(
-                _opacity.to(torch.float).to(self.device).requires_grad_(True)
-            )
-            self._scaling = nn.Parameter(
-                _scaling.to(torch.float).to(self.device).requires_grad_(True)
-            )
-            self._rotation = nn.Parameter(
-                _rotation.to(torch.float).to(self.device).requires_grad_(True)
-            )
-
-            self.active_sh_degree = self.max_sh_degree
+        self.active_sh_degree = self.max_sh_degree
 
     def load_ply(self, path):
         if os.path.exists(os.path.join(path, "point_cloud.ply")):
@@ -758,7 +687,6 @@ class GaussianModelBraindeathOffload(BaseGaussianModel):
         opacities_new = inverse_sigmoid(
             torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01)
         )
-        raise NotImplementedError("I do not think the fair naive has supported densification yet.")
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
@@ -788,48 +716,25 @@ class GaussianModelBraindeathOffload(BaseGaussianModel):
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group["params"][0], None)
             mask = mask.to(group["params"][0].device.type)
-            if stored_state is not None:
-                if "exp_avg" not in stored_state:
-                    stored_state["momentum_buffer"] = stored_state["momentum_buffer"][mask]
-                else:
-                    stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                    stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
-
-                del self.optimizer.state[group["params"][0]]
-                
-                if group["params"][0].is_cuda:
-                    group["params"][0] = nn.Parameter(
-                        (group["params"][0][mask].requires_grad_(True))
-                    )
-                else:
-                    assert mask.dim() == 1
-                    self.parameters_buffer[:torch.sum(mask)] = group["params"][0][mask]
-                    group["params"][0] = nn.Parameter(
-                        (self.parameters_buffer[:torch.sum(mask)].requires_grad_(True))
-                    )
-
-                self.optimizer.state[group["params"][0]] = stored_state
-                optimizable_tensors[group["name"]] = group["params"][0]    
+            assert stored_state is not None, "Optimizer is a stateful optimizer."
+            if "exp_avg" not in stored_state:
+                stored_state["momentum_buffer"] = stored_state["momentum_buffer"][mask]
             else:
-                if group["params"][0].is_cuda:
-                    group["params"][0] = nn.Parameter(
-                        (group["params"][0][mask].requires_grad_(True))
-                    )
-                else:
-                    assert mask.dim() == 1
-                    self.parameters_buffer[:torch.sum(mask)] = group["params"][0][mask]
-                    group["params"][0] = nn.Parameter(
-                        (self.parameters_buffer[:torch.sum(mask)].requires_grad_(True))
-                    )
-                optimizable_tensors[group["name"]] = group["params"][0]
+                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+
+            del self.optimizer.state[group["params"][0]]
+            
+            group["params"][0] = nn.Parameter(
+                group["params"][0][mask].pin_memory().requires_grad_(True)
+            )
+
+            self.optimizer.state[group["params"][0]] = stored_state
+            optimizable_tensors[group["name"]] = group["params"][0]    
                 
         return optimizable_tensors
-    
-
 
     def prune_points(self, mask):
-        raise NotImplementedError("I do not think the fair naive has supported densification yet.")
-
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
         
@@ -853,59 +758,30 @@ class GaussianModelBraindeathOffload(BaseGaussianModel):
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group["params"][0], None)
-            if stored_state is not None:
-                # Update optimizer states.
-                if "exp_avg" not in stored_state:
-                    stored_state["momentum_buffer"] = torch.cat(
-                        (stored_state["momentum_buffer"], torch.zeros_like(extension_tensor)),
-                        dim=0,
-                    )
-                else:
-                    stored_state["exp_avg"] = torch.cat(
-                        (stored_state["exp_avg"], torch.zeros_like(extension_tensor)),
-                        dim=0,
-                    )
-                    stored_state["exp_avg_sq"] = torch.cat(
-                        (stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)),
-                        dim=0,
-                    )
+            assert stored_state is not None, "Optimizer is a stateful optimizer."
 
-                del self.optimizer.state[group["params"][0]]
-                
-                # Update parameters.
-                if group["params"][0].is_cuda:
-                    group["params"][0] = nn.Parameter(
-                        torch.cat(
-                            (group["params"][0], extension_tensor), dim=0
-                        ).requires_grad_(True)
-                    )
-                else:
-                    N = group["params"][0].shape[0]
-                    N_ext = extension_tensor.shape[0]
-                    self.parameters_buffer[N:(N + N_ext)] = extension_tensor
-                    group["params"][0] = nn.Parameter(
-                        self.parameters_buffer[:(N + N_ext)].requires_grad_(True)
-                    )
-                self.optimizer.state[group["params"][0]] = stored_state
-                optimizable_tensors[group["name"]] = group["params"][0]
-            else:
-                if group["params"][0].is_cuda:
-                    group["params"][0] = nn.Parameter(
-                        torch.cat(
-                            (group["params"][0], extension_tensor), dim=0
-                        ).requires_grad_(True)
-                    )
-                else:
-                    N = group["params"][0].shape[0]
-                    N_ext = extension_tensor.shape[0]
-                    self.parameters_buffer[N:(N + N_ext)] = extension_tensor
-                    group["params"][0] = nn.Parameter(
-                        self.parameters_buffer[:(N + N_ext)].requires_grad_(True)
-                    )
-                optimizable_tensors[group["name"]] = group["params"][0]
+            # Update optimizer states.
+            stored_state["exp_avg"] = torch.cat(
+                (stored_state["exp_avg"], torch.zeros_like(extension_tensor)),
+                dim=0,
+            )
+            stored_state["exp_avg_sq"] = torch.cat(
+                (stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)),
+                dim=0,
+            )
+
+            del self.optimizer.state[group["params"][0]]
+            
+            # Update parameters.
+            group["params"][0] = nn.Parameter(
+                torch.cat(
+                    (group["params"][0], extension_tensor), dim=0
+                ).pin_memory().requires_grad_(True)
+            )
+            self.optimizer.state[group["params"][0]] = stored_state
+            optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
-    
 
     def densification_postfix(
         self,
@@ -934,15 +810,15 @@ class GaussianModelBraindeathOffload(BaseGaussianModel):
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self.device)
-        self.sum_visible_count_in_one_batch = torch.zeros((self.get_xyz.shape[0]), device=self.device)
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cpu")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cpu")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cpu")
+        self.sum_visible_count_in_one_batch = torch.zeros((self.get_xyz.shape[0]), device="cpu")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
-        padded_grad = torch.zeros((n_init_points), device=self.device)
+        padded_grad = torch.zeros((n_init_points), device="cpu")
         padded_grad[: grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(
@@ -951,7 +827,7 @@ class GaussianModelBraindeathOffload(BaseGaussianModel):
         )
 
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
-        means = torch.zeros((stds.size(0), 3), device=self.device)
+        means = torch.zeros((stds.size(0), 3), device="cpu")
         samples = torch.normal(mean=means, std=stds)
 
         utils.get_log_file().write(
@@ -982,14 +858,12 @@ class GaussianModelBraindeathOffload(BaseGaussianModel):
         prune_filter = torch.cat(
             (
                 selected_pts_mask,
-                torch.zeros(N * selected_pts_mask.sum(), device=self.device, dtype=bool),
+                torch.zeros(N * selected_pts_mask.sum(), device="cpu", dtype=bool),
             )
         )
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
-
-        raise NotImplementedError("I do not think the fair naive has supported densification yet.")
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(
             torch.norm(grads, dim=-1) >= grad_threshold, True, False
