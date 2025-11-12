@@ -234,6 +234,8 @@ def generate_interpolated_path(
         new_points = np.reshape(new_points.T, (n, sh[1], sh[2]))
         return new_points
 
+    n_interp = max(n_interp, 1)
+
     points = poses_to_points(poses, dist=rot_weight)
     new_points = interp(
         points, n_interp * (points.shape[0] - 1), k=spline_degree, s=smoothness

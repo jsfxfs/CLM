@@ -127,6 +127,8 @@ from utils.general_utils import safe_state
 import utils.general_utils as utils
 from utils.graphics_utils import getWorld2View2
 from utils.system_utils import searchForMaxIteration
+from utils.camera_utils import loadCam
+import psutil
 
 
 def create_camera_from_c2w(
@@ -156,9 +158,12 @@ def create_camera_from_c2w(
     # Convert c2w to R and T for Camera class
     c2w_np = c2w.cpu().numpy() if isinstance(c2w, torch.Tensor) else c2w
     
-    # Extract rotation matrix (first 3x3) and translation (last column)
-    R = c2w_np[:3, :3].T  # Camera uses world-to-camera rotation
-    T = -R @ c2w_np[:3, 3]  # Camera uses world-to-camera translation
+    # # Extract rotation matrix (first 3x3) and translation (last column)
+    # R = c2w_np[:3, :3].T  # Camera uses world-to-camera rotation
+    # T = -R @ c2w_np[:3, 3]  # Camera uses world-to-camera translation
+
+    R = c2w_np[:3, :3]
+    T = c2w_np[:3, 3]
     
     # Create dummy image (not needed for rendering)
     dummy_image = torch.zeros((3, height, width), dtype=torch.float32)
@@ -175,12 +180,18 @@ def create_camera_from_c2w(
         uid=uid,
         offload=True,  # Keep camera on CPU
     )
-    
+    Camera.original_image_backup = None # delete the image
+
+    # if the system cpu memory is low, delete the camera
+    if psutil.virtual_memory().percent > 90: # 90%
+        print("System CPU memory is low, exiting...")
+        exit()
     return camera
 
 
 def generate_trajectory_cameras(
-    train_cameras_info: list,
+    world_to_camera_all: list,
+    camtoworlds_all: list,
     traj_path: str = "interp",
     n_frames: int = 120,
     FoVx: Optional[float] = None,
@@ -192,7 +203,8 @@ def generate_trajectory_cameras(
     Generate camera trajectory for rendering.
     
     Args:
-        train_cameras_info: List of training camera info objects
+        world_to_camera_all: List of world-to-camera transformation matrices
+        camtoworlds_all: List of camera-to-world transformation matrices
         traj_path: Type of trajectory ("interp", "ellipse", "spiral", "original")
         n_frames: Number of frames to generate (ignored for "original")
         FoVx, FoVy: Field of view (uses first training camera if None)
@@ -202,50 +214,27 @@ def generate_trajectory_cameras(
         List of Camera objects for trajectory
     """
     # Check if we have training cameras
-    if len(train_cameras_info) == 0:
+    if len(world_to_camera_all) == 0:
         raise ValueError("No training cameras found in scene")
     
-    # Use first camera's parameters as default
-    first_cam_info = train_cameras_info[0]
-    if FoVx is None:
-        FoVx = first_cam_info.FovX
-    if FoVy is None:
-        FoVy = first_cam_info.FovY
-    if width is None:
-        width = first_cam_info.width
-    if height is None:
-        height = first_cam_info.height
-    
-    # Extract camera-to-world matrices from training cameras
-    train_c2w = []
-    for cam_info in train_cameras_info:
-        R = cam_info.R
-        T = cam_info.T
-        # Convert R, T to c2w
-        w2c = np.eye(4)
-        w2c[:3, :3] = R.T
-        w2c[:3, 3] = T
-        c2w = np.linalg.inv(w2c)
-        train_c2w.append(c2w[:3, :])  # [3, 4]
-    
-    train_c2w = np.array(train_c2w)  # [N, 3, 4]
-    
+    # stack camtoworlds_all to get train_c2w
+    train_c2w = np.stack(camtoworlds_all, axis=0)
     # Generate trajectory based on type
     if traj_path == "original":
         print(f"Using original training poses: {len(train_c2w)} cameras")
-        c2w_traj = train_c2w
+        c2w_traj = train_c2w[:, :3, :]
     else:
         # Use subset of poses for trajectory generation (skip first/last few)
         train_c2w_subset = train_c2w[5:-5] if len(train_c2w) > 10 else train_c2w
         
         if traj_path == "interp":
             c2w_traj = generate_interpolated_path(
-                train_c2w_subset, n_interp=n_frames // len(train_c2w_subset)
+                train_c2w_subset[:, :3, :], n_interp=n_frames // len(train_c2w_subset)
             )
         elif traj_path == "ellipse":
             height_z = train_c2w_subset[:, 2, 3].mean()
             c2w_traj = generate_ellipse_path_z(
-                train_c2w_subset, n_frames=n_frames, height=height_z
+                train_c2w_subset[:, :3, :], n_frames=n_frames, height=height_z
             )
         elif traj_path == "spiral":
             # Compute bounds from training camera positions
@@ -255,7 +244,7 @@ def generate_trajectory_cameras(
                 positions.max(axis=0) + 1.0
             ])
             c2w_traj = generate_spiral_path(
-                train_c2w_subset, bounds=bounds, n_frames=n_frames
+                train_c2w_subset[:, :3, :], bounds=bounds, n_frames=n_frames
             )
         else:
             raise ValueError(f"Unsupported trajectory type: {traj_path}")
@@ -490,6 +479,13 @@ def main():
         # For rendering, we use the maximum degree for best visual quality
         gaussians.active_sh_degree = gaussians.max_sh_degree
     
+    # know the image width and height
+    image_width = scene_info.train_cameras[0].width
+    image_height = scene_info.train_cameras[0].height
+
+    # utils.get_img_width()
+    utils.set_img_size(image_height, image_width)
+
     # Setup background
     background = None
     bg_color = [1, 1, 1] if dataset_args.white_background else None
@@ -497,11 +493,61 @@ def main():
     if bg_color is not None:
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     
+    world_to_camera_all = []
+    camtoworlds_all = []
+    # K_all = []
+    def getWorld2View(R, t):
+        Rt = np.zeros((4, 4))
+        Rt[:3, :3] = R.transpose()
+        Rt[:3, 3] = t
+        Rt[3, 3] = 1.0
+
+        C2W = np.linalg.inv(Rt)
+        # cam_center = C2W[:3, 3]
+        # cam_center = (cam_center + translate) * scale
+        # C2W[:3, 3] = cam_center
+        Rt = np.linalg.inv(C2W)
+        return np.float32(Rt)
+
+    # def getK(FovX, FovY, image_width, image_height):
+    #     tanfovx = math.tan(FovX * 0.5)
+    #     tanfovy = math.tan(FovY * 0.5)
+    #     focal_length_x = image_width / (2 * tanfovx)
+    #     focal_length_y = image_height / (2 * tanfovy)
+    #     K = torch.tensor(
+    #         [
+    #             [focal_length_x, 0, image_width / 2.0],
+    #             [0, focal_length_y, image_height / 2.0],
+    #             [0, 0, 1],
+    #         ],
+    #         # device="cuda",
+    #     )
+    #     return K
+
+    for id, cam_info in tqdm(
+        enumerate(scene_info.train_cameras), total=len(scene_info.train_cameras)
+    ):
+        world_view_transform = (
+            torch.tensor(getWorld2View(cam_info.R, cam_info.T)).transpose(0, 1)
+        )
+        world_to_camera_all.append(world_view_transform)
+        view_world_transform = world_view_transform.t().inverse()
+        camtoworlds_all.append(view_world_transform)
+        # K_all.append(getK(cam_info.FovX, cam_info.FovY, image_width, image_height))
+    FoVx = scene_info.train_cameras[0].FovX
+    FoVy = scene_info.train_cameras[0].FovY
+
+    # import pdb; pdb.set_trace()
     # Generate trajectory cameras
     trajectory_cameras = generate_trajectory_cameras(
-        train_cameras_info=scene_info.train_cameras,
+        world_to_camera_all=world_to_camera_all,
+        camtoworlds_all=camtoworlds_all,
         traj_path=args.traj_path,
         n_frames=args.n_frames,
+        FoVx=FoVx,
+        FoVy=FoVy,
+        width=image_width,
+        height=image_height,
     )
     
     # Render trajectory video
