@@ -97,7 +97,7 @@ class AuxiliaryParams(ParamGroup):
         # ====================================================================
         # DATA LOADING & DATASET
         # ====================================================================
-        self.decode_dataset_path = "/tmp"  # Path for decoded dataset storage
+        self.decode_dataset_path = ""  # Path for decoded dataset storage
         self.num_workers = 0             # Number of worker threads for data loading
         self.sharing_strategy = "default" # PyTorch multiprocessing sharing strategy: "default" ("file_descriptor"), or "file_system"
         self.llffhold = 8                # LLFF dataset hold-out value
@@ -123,7 +123,7 @@ class AuxiliaryParams(ParamGroup):
         # TRAINING CONTROL & EVALUATION
         # ====================================================================
         self.test_iterations = [7_000, 30_000]     # Iterations at which to run test evaluation
-        self.save_iterations = [7_000, 30_000]     # Iterations at which to save model
+        self.save_iterations = []     # Iterations at which to save model
         self.checkpoint_iterations = []  # Iterations at which to save checkpoints
         
         # ====================================================================
