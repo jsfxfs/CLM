@@ -58,7 +58,7 @@ SAVE_ITERATIONS="40000 100000"
 
 # Densification parameters
 DENSIFY_OPTS="--densify_from_iter 4000 \
---densify_until_iter 20000 \
+--densify_until_iter 35000 \
 --densify_grad_threshold 0.00015 \
 --percent_dense 0.005 \
 --opacity_reset_interval 3000"
