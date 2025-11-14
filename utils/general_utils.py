@@ -243,22 +243,6 @@ def check_memory_usage(log_file, args, iteration, gaussians, before_densificatio
     if args.check_gpu_memory:
         log_file.write(log_str)
 
-    if before_densification_stop:
-        total_memory = (
-            torch.cuda.get_device_properties(0).total_memory / 1024 / 1024 / 1024
-        )
-        if (
-            max_reserved_memory
-            > args.densify_memory_limit_percentage * total_memory
-        ):  # If memory usage is reaching the upper bound of GPU memory, stop densification to avoid OOM by fragmentation and etc.
-            print(
-                "Reserved Memory usage is reaching the upper bound of GPU memory. stop densification.\n"
-            )
-            log_file.write(
-                "Reserved Memory usage is reaching the upper bound of GPU memory. stop densification.\n"
-            )
-            args.disable_auto_densification = True
-
 
 def PILtoTorch(pil_image, resolution, args, log_file, decompressed_image=None):
     if decompressed_image is not None:
