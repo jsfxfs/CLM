@@ -79,7 +79,7 @@ class AuxiliaryParams(ParamGroup):
         
         # --- CLM Offload ---
         self.clm_offload = False             # Enable final offload mode (required for pipelined_offload)
-        self.prealloc_capacity = 5_000_000  # Pre-allocated capacity for parameters
+        self.prealloc_capacity = -1  # Pre-allocated capacity for parameters
         # --- CLM Offload Advanced Flags (you might not need to change these) ---
         self.comm_stream_priority = -1 # by default, use -1 as the priority of the stream
         self.grid_size_H = 32            # Grid size for height dimension (used in filtering/spatial hashing)

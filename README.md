@@ -151,6 +151,8 @@ If you don't specify `--prealloc_capacity`, the system automatically calculates 
 Number of Gaussians = (remaining CPU memory × 0.7) / (48 × 4 × 4 bytes)
 ```
 
+**Rule of thumb**: Approximately 8 GB CPU memory per 10 million Gaussians.
+
 Where:
 - 48 = number of spherical harmonic coefficients offloaded to CPU RAM
 - First 4 = bytes per float32
@@ -163,7 +165,7 @@ Where:
 
 This codebase uses microbatch pipelining with gradient accumulation. For each microbatch, we render one image and perform one backpropagation. The `--bsz` flag controls how many images to process before each optimizer step.
 
-This is design choice is important. Without microbatch pipelining, activation memory would grow linearly with batch size. With pipelining, activation memory remains constant at the level needed for rendering a single image.
+This design choice is important. Without microbatch pipelining, activation memory would grow linearly with batch size. With pipelining, activation memory remains constant at the level needed for rendering a single image.
 
 Learning rate and momentum are scaled according to Grendel-GS rules when increasing `--bsz`. Currently, `clm_offload` supports batch sizes of 4, 8, 16, 32, and 64. 
 

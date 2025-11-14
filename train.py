@@ -99,6 +99,17 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         utils.print_rank_0("Using GaussianModelNaiveOffload")
         log_file.write("Using GaussianModelNaiveOffload\n")
     elif args.clm_offload:
+        # Automatically calculate prealloc_capacity if not specified
+        if args.prealloc_capacity == -1:
+            # Get available CPU memory in bytes
+            available_memory = psutil.virtual_memory().available
+            
+            # Calculate capacity using formula: (remaining CPU memory × 0.7) / (48 × 4 × 4 bytes)
+            # 48 = spherical harmonic coefficients, 4 = bytes per float32, 4 = (param + grad + 2 optimizer states)
+            args.prealloc_capacity = int((available_memory * 0.7) / (48 * 4 * 4)) // 16 * 16 # round to the nearest multiple of 16
+            
+            utils.print_rank_0(f"Auto-calculated prealloc_capacity: {args.prealloc_capacity:,} Gaussians ({available_memory / (1024**3):.2f} GB available CPU memory)")
+            log_file.write(f"Auto-calculated prealloc_capacity: {args.prealloc_capacity:,} Gaussians ({available_memory / (1024**3):.2f} GB available CPU memory)\n")
         gaussians = GaussianModelCLMOffload(sh_degree=dataset_args.sh_degree)
         utils.print_rank_0("Using GaussianModelCLMOffload")
         log_file.write("Using GaussianModelCLMOffload\n")
