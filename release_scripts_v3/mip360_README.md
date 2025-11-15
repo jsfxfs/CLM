@@ -39,6 +39,30 @@ CUDA_VISIBLE_DEVICES=1 bash release_scripts/mip360.sh /mnt/nvme0/dataset/360_v2_
 
 1. In this set of experiment, --prealloc_capacity 7_000_000 is the number of pre-allocated buffer on CPU pinned memory for storing gaussian. If your CPU memory is very very small (less than 8GB), you may encounter OOM. Then you need to make the densification less aggressive, and at the same time reduce the prealloc_capacity. 
 
-## Experiment results in our testbed
+## PSNR Comparison by Scene and Offload Type
 
 We compare the psnr results for all scenes between three modes. 
+
+## Test PSNR
+
+| Scene   |   CLM Offload |   Naive Offload |   No Offload |
+|:--------|--------------:|----------------:|-------------:|
+| bicycle |         25.24 |           25.24 |        25.22 |
+| bonsai  |         32.11 |           31.81 |        32.1  |
+| counter |         29.07 |           29.08 |        28.97 |
+| garden  |         27.36 |           27.35 |        27.31 |
+| kitchen |         31.53 |           31.48 |        31.4  |
+| room    |         31.39 |           31.45 |        31.46 |
+| stump   |         26.7  |           26.68 |        26.62 |
+
+## Train PSNR
+
+| Scene   |   CLM Offload |   Naive Offload |   No Offload |
+|:--------|--------------:|----------------:|-------------:|
+| bicycle |         26.38 |           26.37 |        26.23 |
+| bonsai  |         33.26 |           33.26 |        33.43 |
+| counter |         30.5  |           30.65 |        30.47 |
+| garden  |         29.8  |           29.85 |        29.72 |
+| kitchen |         33.15 |           32.93 |        32.77 |
+| room    |         34.17 |           34.21 |        34.18 |
+| stump   |         30.69 |           31.09 |        30.63 |
