@@ -37,7 +37,9 @@ CUDA_VISIBLE_DEVICES=1 bash release_scripts/mip360.sh /mnt/nvme0/dataset/360_v2_
 
 ## Notes on Hyperparameters
 
-1. In this set of experiment, --prealloc_capacity 7_000_000 is the number of pre-allocated buffer on CPU pinned memory for storing gaussian. If your CPU memory is very very small (less than 8GB), you may encounter OOM. Then you need to make the densification less aggressive, and at the same time reduce the prealloc_capacity. 
+1. **Pre-allocation Capacity**: `--prealloc_capacity 7_000_000` specifies the number of Gaussians to pre-allocate in CPU pinned memory. If you have limited CPU memory (< 8GB), you may encounter out-of-memory errors. In this case, reduce densification aggressiveness and lower the `--prealloc_capacity` value accordingly.
+
+2. **Batch Size**: We use `--bsz 4` for all scenes in these experiments. 
 
 ## PSNR Comparison by Scene and Offload Type
 
