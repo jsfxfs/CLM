@@ -5,31 +5,63 @@
 # Note: This dataset is synthetic and designed to showcase maximum scalability
 
 # Check arguments
-if [ $# -ne 1 ]; then
-    echo "Error: Please specify exactly one argument."
-    echo "Usage: bash bigcity.sh <dataset_folder>"
+if [ $# -ne 3 ]; then
+    echo "Error: Please specify exactly three arguments."
+    echo "Usage: bash bigcity.sh <dataset_folder> <offload_strategy> <scale>"
     echo ""
     echo "Arguments:"
-    echo "  <dataset_folder> : Path to the MatrixCity BigCity dataset folder"
-    echo "                     (e.g., /path/to/matrixcity/big_city/aerial/pose/all_blocks)"
+    echo "  <dataset_folder>   : Path to the MatrixCity BigCity dataset folder"
+    echo "                       (e.g., /path/to/matrixcity/big_city/aerial/pose/all_blocks)"
+    echo "  <offload_strategy> : One of: no_offload, clm_offload, naive_offload"
+    echo "  <scale>            : One of: 100m (100M Gaussians), 25m (25M Gaussians)"
     echo ""
-    echo "Example:"
-    echo "  bash bigcity.sh /path/to/matrixcity/big_city/aerial/pose/all_blocks"
+    echo "Examples:"
+    echo "  bash bigcity.sh /path/to/matrixcity/big_city/aerial/pose/all_blocks clm_offload 100m"
+    echo "  bash bigcity.sh /path/to/matrixcity/big_city/aerial/pose/all_blocks clm_offload 25m"
+    echo "  bash bigcity.sh /path/to/matrixcity/big_city/aerial/pose/all_blocks no_offload 25m"
     echo ""
-    echo "Note: This script uses only clm_offload strategy due to extreme scale (102M+ Gaussians)"
+    echo "Note: Only clm_offload can handle 100m scale without OOM on typical GPUs"
     exit 1
 fi
 
 dataset_folder=$1
+offload_strategy=$2
+scale=$3
+
+# Validate offload strategy
+if [[ ! "$offload_strategy" =~ ^(no_offload|clm_offload|naive_offload)$ ]]; then
+    echo "Error: Invalid offload strategy '$offload_strategy'"
+    echo "Must be one of: no_offload, clm_offload, naive_offload"
+    exit 1
+fi
+
+# Validate scale
+if [[ ! "$scale" =~ ^(100m|25m)$ ]]; then
+    echo "Error: Invalid scale '$scale'"
+    echo "Must be one of: 100m, 25m"
+    exit 1
+fi
 
 echo "Dataset folder: $dataset_folder"
-echo "Offload strategy: clm_offload (required for extreme scale)"
+echo "Offload strategy: $offload_strategy"
+echo "Scale: $scale"
 
 # Generate timestamp for experiment naming
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
+# Set pre-allocated capacity based on scale
+if [ "$scale" == "100m" ]; then
+    CAPACITY=102_231_360  # ~102M Gaussians
+    CAPACITY_DESC="102M"
+    PC_DOWNSAMPLE_RATIO=1.0
+elif [ "$scale" == "25m" ]; then
+    CAPACITY=25_557_840   # ~25M Gaussians
+    CAPACITY_DESC="25M"
+    PC_DOWNSAMPLE_RATIO=1.0
+fi
+
 # Experiment name
-expe_name="bigcity_102m_clm_offload"
+expe_name="bigcity_${scale}_${offload_strategy}"
 
 # Set output paths
 log_folder="output/bigcity/${TIMESTAMP}_${expe_name}"
@@ -52,11 +84,20 @@ SAVE_ITERATIONS="200000 500000"
 # We use pre-allocated capacity instead of auto-densification
 DENSIFY_OPTS="--disable_auto_densification"
 
-# Offload configuration - CLM offload with pre-allocated capacity
-# Pre-allocate for 102M+ Gaussians
-OFFLOAD_OPTS="--clm_offload \
---prealloc_capacity 102_231_360 \
+# Configure offload options based on strategy
+OFFLOAD_OPTS=""
+if [ "$offload_strategy" == "clm_offload" ]; then
+    OFFLOAD_OPTS="--clm_offload \
+--prealloc_capacity ${CAPACITY} \
 --sparse_adam"
+elif [ "$offload_strategy" == "naive_offload" ]; then
+    OFFLOAD_OPTS="--naive_offload \
+--prealloc_capacity ${CAPACITY} \
+--sparse_adam"
+elif [ "$offload_strategy" == "no_offload" ]; then
+    OFFLOAD_OPTS="--no_offload \
+--prealloc_capacity ${CAPACITY}"
+fi
 
 # Monitoring settings
 MONITOR_OPTS="--enable_timer \
@@ -73,19 +114,31 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo ""
 echo "========================================"
-echo "Training MatrixCity BigCity (Extreme Scale)"
+echo "Training MatrixCity BigCity"
 echo "========================================"
-echo "Strategy: clm_offload"
+echo "Strategy: $offload_strategy"
+echo "Scale: $CAPACITY_DESC Gaussians"
 echo "Batch size: $BSZ"
 echo "Iterations: $ITERATIONS"
-echo "Pre-allocated capacity: 102,231,360 Gaussians"
+echo "Pre-allocated capacity: $CAPACITY Gaussians"
 echo "========================================"
 echo ""
-echo "WARNING: This is an extreme-scale experiment that will take"
-echo "5-10 hours and requires significant computational resources."
-echo "Press Ctrl+C within 5 seconds to cancel..."
-echo ""
-sleep 5
+
+# Add warning for 100m scale or no_offload/naive_offload strategies
+if [ "$scale" == "100m" ] || [ "$offload_strategy" == "no_offload" ] || [ "$offload_strategy" == "naive_offload" ]; then
+    if [ "$scale" == "100m" ] && [ "$offload_strategy" != "clm_offload" ]; then
+        echo "WARNING: $offload_strategy with $scale scale will likely result in OOM!"
+        echo "This is expected behavior for demonstration purposes."
+        echo ""
+    fi
+    if [ "$scale" == "100m" ]; then
+        echo "NOTE: This is an extreme-scale experiment that will take"
+        echo "5-10 hours and requires significant computational resources."
+    fi
+    echo "Press Ctrl+C within 5 seconds to cancel..."
+    echo ""
+    sleep 5
+fi
 
 # Run training
 python train.py \
@@ -103,7 +156,8 @@ python train.py \
     --eval \
     --save_tensors \
     --num_save_images_during_eval 10 \
-    --max_num_images_to_evaluate 200
+    --max_num_images_to_evaluate 200 \
+    --initial_point_cloud_downsampled_ratio ${PC_DOWNSAMPLE_RATIO}
 
 # save_tensors is very important for matrixcity. 
 

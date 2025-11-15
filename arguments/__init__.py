@@ -102,6 +102,7 @@ class AuxiliaryParams(ParamGroup):
         self.sharing_strategy = "default" # PyTorch multiprocessing sharing strategy: "default" ("file_descriptor"), or "file_system"
         self.llffhold = 8                # LLFF dataset hold-out value
         
+        self.initial_point_cloud_downsampled_ratio = 1.0
         # ====================================================================
         # MODEL I/O
         # ====================================================================
