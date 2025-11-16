@@ -57,11 +57,11 @@ if [ "$scale" == "100m" ]; then
 elif [ "$scale" == "25m" ]; then
     CAPACITY=25_557_840   # ~25M Gaussians
     CAPACITY_DESC="25M"
-    PC_DOWNSAMPLE_RATIO=1.0
+    PC_DOWNSAMPLE_RATIO=0.25
 fi
 
 # Experiment name
-expe_name="bigcity_${scale}_${offload_strategy}"
+expe_name="bigcity_${scale}_${offload_strategy}_${CAPACITY_DESC}"
 
 # Set output paths
 log_folder="output/bigcity/${TIMESTAMP}_${expe_name}"

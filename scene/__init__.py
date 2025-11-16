@@ -200,7 +200,8 @@ class Scene:
             )
         else:
             # Three model types use create_from_pcd
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, 
+                subsample_ratio=args.initial_point_cloud_downsampled_ratio)
 
         utils.check_initial_gpu_memory_usage("after initializing point cloud")
         utils.log_cpu_memory_usage("after loading initial 3dgs points")

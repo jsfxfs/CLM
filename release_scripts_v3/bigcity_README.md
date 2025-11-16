@@ -47,6 +47,8 @@ CUDA_VISIBLE_DEVICES=0 bash release_scripts_v3/bigcity.sh /path/to/matrixcity/bi
 CUDA_VISIBLE_DEVICES=0 bash release_scripts_v3/bigcity.sh /path/to/matrixcity/big_city/aerial/pose/all_blocks naive_offload 25m
 ```
 
+<!-- CUDA_VISIBLE_DEVICES=1 bash release_scripts_v3/bigcity.sh /mnt/nvme0/dataset/matrixcity/big_city/aerial/pose/all_blocks 25m -->
+
 **Note:** `no_offload` and `naive_offload` strategies typically result in out-of-memory (OOM) errors for 100M scale. Only `clm_offload` can successfully handle extreme scales.
 
 ### Output
@@ -63,12 +65,23 @@ python release_scripts_v3/log2csv.py output/bigcity
 
 This will generate a CSV summary of PSNR, training time, and memory usage across all experiments.
 
-## Expected Results
+## Experiments Results on our testbed
 
 The experiments report the following metrics for each configuration:
 - **PSNR** (Peak Signal-to-Noise Ratio)
 - **Training time**
 - **Maximum GPU memory usage**
-- **Maximum CPU memory usage**
+- **Pinned CPU Memory (GB)**
 
 The `clm_offload` strategy demonstrates significant memory efficiency while maintaining rendering quality, enabling training at scales that would otherwise be impossible on standard hardware. 
+
+<!-- python bigcitypostprocess.py /home/hexu/clm_release/Grendel-XS/output/bigcity/experiment_results.csv -->
+
+| Experiment                    | Test PSNR   | Train PSNR   | Num 3DGS   | Max GPU Memory (GB)   | Pinned CPU Memory (GB)   | Training Time (s)   |
+|:------------------------------|:------------|:-------------|:-----------|:----------------------|:-------------------------|:--------------------|
+| bigcity_100m_clm_offload_102M | 25.5        | 26.84        | 102231360  | 20.79                 | 37.41                    | 11783.36            |
+| bigcity_102M_naive_offload    | OOM         | OOM          | OOM        | OOM                   | OOM                      | OOM                 |
+| bigcity_102M_no_offload       | OOM         | OOM          | OOM        | OOM                   | OOM                      | OOM                 |
+| bigcity_25m_clm_offload_25M   | 24.63       | 25.9         | 25557840   | 5.64                  | 10.04                    | 6029.05             |
+| bigcity_25m_naive_offload_25M | 24.29       | 25.12        | 25557840   | 12.13                 | 19.87                    | 10187.07            |
+| bigcity_25M_no_offload        | OOM         | OOM          | OOM        | OOM                   | OOM                      | OOM                 |

@@ -96,3 +96,16 @@ For `clm_offload`, the script pre-allocates 30M capacity in CPU pinned memory. I
 - **No offload**: Requires sufficient GPU memory to hold all Gaussians (may OOM for 28M)
 - **Naive offload**: Offloads to CPU but with higher overhead
 - **CLM offload**: Most memory-efficient, recommended for large scales
+
+# Rubble 4K Experiment Results
+
+## Performance Metrics by Model Size and Offload Strategy
+
+| Experiment                 | Test PSNR   | Train PSNR   | Num 3DGS   | Max GPU Memory (GB)   | Pinned CPU Memory (GB)   | Training Time (s)   |
+|:---------------------------|:------------|:-------------|:-----------|:----------------------|:-------------------------|:--------------------|
+| rubble4k_10m_clm_offload   | 26.03       | 27.4         | 10149035   | 7.05                  | 11.47                    | 12381.47            |
+| rubble4k_10m_naive_offload | 25.92       | 27.29        | 10335575   | 9.32                  | 11.46                    | 22254.41            |
+| rubble4k_10m_no_offload    | 26.14       | 27.36        | 10058114   | 16.81                 | 0.62                     | 11702.31            |
+| rubble4k_28m_clm_offload   | 26.75       | 28.3         | 27992096   | 13.0                  | 12.32                    | 24757.44            |
+| rubble4k_28m_naive_offload | 26.72       | 28.19        | 27385268   | 19.03                 | 14.58                    | 40820.35            |
+| rubble4k_28M_no_offload    | OOM         | OOM          | OOM        | OOM                   | OOM                      | OOM                 |

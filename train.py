@@ -73,7 +73,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     
     # FIXME: add support for load_from_cpuram_on_demand
     assert args.dataset_cache_and_stream_mode in ["load_from_disk_on_demand"], f"Only load_from_disk_on_demand is supported for now, but got {args.dataset_cache_and_stream_mode}"
-    assert args.initial_point_cloud_downsampled_ratio == 1.0, "Only 1.0 is supported for now"
     # ------------------------------------------------------------------------
     # 1.1: Setup auxiliary tools and GPU configuration
     # ------------------------------------------------------------------------

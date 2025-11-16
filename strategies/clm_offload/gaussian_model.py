@@ -32,7 +32,7 @@ class GaussianModelCLMOffload(BaseGaussianModel):
     def _get_device(self):
         return "cuda"
 
-    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float):
+    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float, subsample_ratio: float = 1.0):
         log_file = utils.get_log_file()
         self.spatial_lr_scale = spatial_lr_scale
 
@@ -60,6 +60,21 @@ class GaussianModelCLMOffload(BaseGaussianModel):
             0.0000001,
         )
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3).to("cuda")
+
+        if subsample_ratio != 1.0:
+            assert subsample_ratio > 0 and subsample_ratio < 1
+            sub_N = int(N * subsample_ratio)
+            print("Subsample ratio: ", subsample_ratio)
+            print("Number of points after subsampling : ", sub_N)
+
+            perm_generator = torch.Generator()
+            perm_generator.manual_seed(1)
+            subsampled_set_gpu, _ = torch.randperm(N)[:sub_N].sort()
+            subsampled_set_cpu = subsampled_set_gpu.to("cpu")
+            fused_point_cloud = fused_point_cloud[subsampled_set_gpu]
+            features = features[subsampled_set_cpu]
+            scales = scales[subsampled_set_gpu]
+            N = sub_N
 
         rots = torch.zeros((N, 4), device="cuda")
         rots[:, 0] = 1
