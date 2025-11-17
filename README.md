@@ -3,12 +3,12 @@
     <a href="https://github.com/nerfstudio-project/nerfstudio/blob/master/LICENSE">
         <img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
     <!-- stars badge -->
-    <a href="https://github.com/nyu-systems/Grendel-GS/stargazers">
-        <img alt="GitHub stars" src="https://img.shields.io/github/stars/nyu-systems/Grendel-GS?style=social"/>
+    <a href="https://github.com/nyu-systems/CLM-GS/stargazers">
+        <img alt="GitHub stars" src="https://img.shields.io/github/stars/nyu-systems/CLM-GS?style=social"/>
     </a>
     <!-- pull requests badge -->
-    <a href="https://github.com/nyu-systems/Grendel-GS/pulls">
-        <img alt="Pull Requests" src="https://img.shields.io/github/issues-pr/nyu-systems/Grendel-GS"/>
+    <a href="https://github.com/nyu-systems/CLM-GS/pulls">
+        <img alt="Pull Requests" src="https://img.shields.io/github/issues-pr/nyu-systems/CLM-GS"/>
     </a>
 
 </p>
@@ -25,23 +25,32 @@ _<h4>✨ Accepted to appear in ASPLOS 2026 ✨</h4>_
 
 <div align="left">
 
-<div align="center">
+<!-- <div align="center">
     <img src="assets/teaser.png" width="900">
+</div> -->
+<div align="center">
+    <img src="https://via.placeholder.com/900x400/cccccc/666666?text=Teaser+Image+Coming+Soon" width="900" alt="Teaser image placeholder">
 </div>
 
 # Overview
 
-**CLM** enables training of extreme-scale 3D Gaussian Splatting scenes that exceed GPU memory capacity. We explore optimal memory management strategies for 3DGS by training using both GPU and CPU simultaneously, offloading model states and computation to CPU. 
+CLM enables training of large-scale 3D Gaussian Splatting scenes that exceed GPU memory capacity by also exploiting CPU memory. 
+<!-- We explore optimal memory management strategies for 3DGS by training using both GPU and CPU simultaneously, offloading model states and computation to CPU.  -->
 
 By using CLM offloading, your 3DGS training can:
-- **Train extreme-scale scenes** with 100+ million Gaussians on a single 24GB GPU and 128GB RAM
+- **Train large-scale scenes** with 100+ million Gaussians on a single 24GB GPU and 128GB RAM
 - **Maintain rendering quality** with a mathematically identical rendering formula
 - **Work with existing rendering kernels**: We use off-the-shelf rendering kernels from gsplat. Our offloading design is orthogonal to these rendering kernels, making it easy to integrate with your own splatting pipelines
 
-This codebase provides three modes of memory-efficient training for your reference:
+This codebase provides three modes of memory-efficient training strategies for your reference:
 - **no_offload**: GPU-only training that optimizes memory usage on a single GPU. It also a baseline for the two offloadin modes below. (see `strategies/no_offload`)
 - **naive_offload**: A simple CPU offloading implementation that demonstrates the simplest offloading strategy, though it is slower (see `strategies/naive_offload`)
-- **clm_offload**: Our most sophisticated offloading design that reduces memory usage to the extreme while maintaining good performance. The code is more complex but highly efficient (see `strategies/clm_offload`) 
+- **clm_offload**: Our most sophisticated offloading design that reduces memory usage to the extreme while maintaining good speed. The code is more complex but highly efficient (see `strategies/clm_offload`) 
+
+We also provide multiple engineering-level memory-efficient optimizations: 
+- Store the dataset on disk and stream data on-demand to reduce RAM and GPU memory consumption. 
+- Frequently release memory and reduce memory fragmentation. 
+- Set `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce memory fragmentation. 
 
 **Table of contents**
 -----
@@ -61,9 +70,7 @@ This codebase provides three modes of memory-efficient training for your referen
 
 **The goal of CLM-GS is to solve GPU out-of-memory problems in 3DGS Training. **
 
-Traditional 3D Gaussian Splatting stores all parameters, optimizer states, and activation states on GPU, which severely limits the scene scale you can reconstruct due to GPU memory constraints. When the scene is very large and intricate, the large number of required Gaussians linearly increases memory consumption for parameters and optimizer states. When rendering high-resolution images, activation states also grow larger. As a result, GPU out-of-memory errors become a common issue. 
-
-TODO: Add a few statistics later. 
+Traditional 3D Gaussian Splatting stores all parameters, optimizer states, and activation states on GPU, which severely limits the scene scale you can reconstruct due to GPU memory constraints (24GB on 4090). When the scene is very large and intricate, the large number of required Gaussians linearly increases memory consumption for parameters and optimizer states. When rendering high-resolution images, activation states also grow larger. As a result, GPU out-of-memory errors become a common issue. 
 
 # How to use CLM-GS
 
@@ -73,7 +80,7 @@ TODO: Add a few statistics later.
 
 The repository contains submodules, thus please check it out with 
 ```shell
-git clone git@github.com:nyu-systems/Grendel-GS.git --recursive
+git clone git@github.com:nyu-systems/CLM-GS.git --recursive
 ```
 
 ### A Conda Environment (FIXME)
@@ -99,16 +106,19 @@ NOTES: We kept additional dependencies minimal compared to the original 3DGS. Fo
 
 **No Offload (GPU-Only, for small scenes)**:
 ```shell
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python train.py -s <path to COLMAP dataset> --no_offload --bsz 4
 ```
 
 **Naive Offload (Simple offloading for medium scenes)**:
 ```shell
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python train.py -s <path to COLMAP dataset> --naive_offload --bsz 4
 ```
 
 **CLM Offload (Recommended for large scenes)**:
 ```shell
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python train.py -s <path to COLMAP dataset> --clm_offload --bsz 4
 ```
 
