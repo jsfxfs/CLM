@@ -136,12 +136,16 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python train.py -s <path to COLMAP dataset> --clm_offload --bsz 4
 ```
 
-## Difference between these offloading strategies
+## Considerations about the flags
 
+### **Three offloading strategies** (FIXME)
 
-### Advanced Options
+To be simple, `no_offload` is just a GPU-only training baseline for the other two offloading strategies to compare. 
+And the `naive_offload` is an easy implementation but it is slow and cannot handle extreme large scene; CLM is fast and can support even larger gaussians model. 
 
-#### **Dataset Caching and Streaming**
+TODO: maybe draw a table?
+
+### **Dataset Caching and Streaming**
 
 This codebase saves the dataset on disk and loads it on-demand during training to conserve CPU RAM. This is because, for extremely large datasets, you may not be able to decode the entire dataset into CPU RAM, let alone GPU memory. Note that streaming from disk to GPU is slower than streaming from CPU RAM to GPU.
 
@@ -159,7 +163,7 @@ This mode decodes JPG/PNG images into raw byte data when you first train on a da
 
 This mode avoids pre-decoding images, saving disk storage space. However, decoding images on the CPU before each rendering pass is slower and consumes additional CPU computation.
 
-#### **Pre-allocate buffers for Gaussians on CPU RAM**
+### **Pre-allocate buffers for Gaussians on CPU RAM**
 
 For CLM offload mode, you can specify how many Gaussians to pre-allocate in CPU pinned memory:
 
@@ -218,11 +222,6 @@ Learning rate and momentum are scaled according to Grendel-GS rules when increas
 </details>
 <br>
 
-## (FIXME) Choosing the Right Strategy
-
-
-## (FIXME) Considerations about the flags
-
 ---
 
 # Example Usages
@@ -270,15 +269,14 @@ Our system design, memory management strategies, and scaling insights are docume
 <section class="section" id="BibTeX">
   <div class="container is-max-desktop content">
     <h2 class="title">BibTeX</h2>
-    <pre><code>@misc{zhao2025clmremovinggpumemory,
-  title={CLM: Removing the GPU Memory Barrier for 3D Gaussian Splatting}, 
-  author={Hexu Zhao and Xiwen Min and Xiaoteng Liu and Moonjun Gong and Yiming Li and Saining Xie and Ang Li and Jinyang Li and Aurojit Panda},
-  year={2025},
-  eprint={2511.04951},
-  archivePrefix={arXiv},
-  primaryClass={cs.CV},
-  url={https://arxiv.org/abs/2511.04951}, 
-}</code></pre>
+    <pre><code>@inproceedings{zhao2025clm,
+      title={CLM: Removing the GPU Memory Barrier for 3D Gaussian Splatting},
+      author={Hexu Zhao and Xiwen Min and Xiaoteng Liu and Moonjun Gong and Yiming Li and Ang Li and Saining Xie and Jinyang Li and Aurojit Panda},
+      booktitle={Proceedings of the 2026 International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS'26)},
+      year={2026},
+      address={Pittsburgh, PA, USA},
+      url={https://arxiv.org/abs/2511.04951}
+    }</code></pre>
   </div>
 </section> 
 
