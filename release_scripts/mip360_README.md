@@ -41,11 +41,11 @@ This command will process the experiment logs and produce a CSV of training resu
 
 2. **Batch Size**: We use `--bsz 4` for all scenes in these experiments. 
 
-## PSNR Comparison by Scene and Offload Type
+## Experimental Results and Performance Comparison
 
-Below are the PSNR results for all scenes using each offloading mode. These values were obtained on our testbed: AMD Ryzen Threadripper PRO 5955WX 16-core CPU, 128 GB RAM, and an NVIDIA RTX 4090 GPU over PCIe 4.0.
+Below are the performance metrics (test PSNR, max GPU memory usage, and number of Gaussians) for all scenes across different offloading modes. These results were obtained on our testbed: AMD Ryzen Threadripper PRO 5955WX 16-core CPU, 128 GB RAM, and NVIDIA RTX 4090 GPU over PCIe 4.0.
 
-## Test PSNR
+### Test PSNR Comparison
 
 | Scene   |   CLM Offload |   Naive Offload |   No Offload |
 |:--------|--------------:|----------------:|-------------:|
@@ -57,14 +57,26 @@ Below are the PSNR results for all scenes using each offloading mode. These valu
 | room    |         31.39 |           31.45 |        31.46 |
 | stump   |         26.7  |           26.68 |        26.62 |
 
-## Train PSNR
+### Maximum GPU Memory Usage (GB)
 
 | Scene   |   CLM Offload |   Naive Offload |   No Offload |
 |:--------|--------------:|----------------:|-------------:|
-| bicycle |         26.38 |           26.37 |        26.23 |
-| bonsai  |         33.26 |           33.26 |        33.43 |
-| counter |         30.5  |           30.65 |        30.47 |
-| garden  |         29.8  |           29.85 |        29.72 |
-| kitchen |         33.15 |           32.93 |        32.77 |
-| room    |         34.17 |           34.21 |        34.18 |
-| stump   |         30.69 |           31.09 |        30.63 |
+| bicycle |          3.01 |            4.8  |         8.21 |
+| bonsai  |          0.82 |            1.1  |         1.75 |
+| counter |          0.97 |            1.25 |         1.73 |
+| garden  |          3.03 |            4.78 |         7.7  |
+| kitchen |          1.54 |            2.08 |         2.49 |
+| room    |          0.99 |            1.3  |         2.18 |
+| stump   |          1.99 |            3.5  |         6.57 |
+
+### Final Gaussian Count at the end of training
+
+| Scene   |   CLM Offload |   Naive Offload |   No Offload |
+|:--------|--------------:|----------------:|-------------:|
+| bicycle |       6059752 |         6042092 |      5948420 |
+| bonsai  |       1192793 |         1221540 |      1215377 |
+| counter |       1186214 |         1184420 |      1190278 |
+| garden  |       5559175 |         5555428 |      5575947 |
+| kitchen |       1768105 |         1760823 |      1776933 |
+| room    |       1543490 |         1541171 |      1551058 |
+| stump   |       4729374 |         4873021 |      4752599 |
