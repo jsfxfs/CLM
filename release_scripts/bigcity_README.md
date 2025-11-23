@@ -37,7 +37,9 @@ Where:
 - `/path/to/matrixcity/big_city/aerial/{train, test}` contains the official MatrixCity BigCity Aerial dataset files (decompressed from their Hugging Face repository).
 - `/path/to/matrixcity/big_city/aerial/pose/all_blocks/` contains the JSON files and the large initial point cloud (downloaded from the `HexuZhao/matrixcity_bigcity_aerial_102M_initial_point_cloud` Hugging Face link).
 
-**Important:** Ensure your folders are organized exactly as shown above. This is necessary for the training scripts to locate the images correctly. 
+**NOTE:** Ensure your folders are organized exactly as shown above. This is necessary for the training scripts to locate the images correctly. 
+
+**NOTE:** This dataset is not in COLMAP format. The MatrixCity BigCity Aerial dataset format is currently the only non-COLMAP format supported by the codebase. You can extend support for other data formats if needed. 
 
 ## Running Experiments
 
