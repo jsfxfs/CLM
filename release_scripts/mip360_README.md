@@ -41,6 +41,8 @@ This command will process the experiment logs and produce a CSV of training resu
 
 2. **Batch Size**: We use `--bsz 4` for all scenes in these experiments. 
 
+3. **Dataset Decoding**: Training begins by decoding all JPEG images to raw format and saving them locally to disk. This step significantly improves data loading speed during training. Decoding is required only once, and future training runs will reuse already-decoded images if they exist. For optimal performance, use a fast local drive (avoid network storage such as NFS), and please refer to the **Dataset Caching and Streaming** section in `README.md` for further information. 
+
 ## Experimental Results and Performance Comparison
 
 Below are the performance metrics (test PSNR, max GPU memory usage, and number of Gaussians) for all scenes across different offloading modes. 

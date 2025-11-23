@@ -94,6 +94,10 @@ The 102M scale uses the 102M initial point cloud. The 25M version is created by 
 
 For `clm_offload`, the script pre-allocates 102 Millions gaussians capacity in CPU pinned memory. If your system has small CPU memory (e.g., < 100GB), you may be only able to train the 25M scale setup which uses less aggressive densification. 
 
+### Dataset Decoding
+
+Training begins by decoding all JPEG images to raw format and saving them locally to disk. This step significantly improves data loading speed during training. Because the BigCity dataset is very large (the decoded images use about 500GB of disk space), ensure you have sufficient disk space before starting. Decoding is required only once, and future training runs will reuse already-decoded images if they exist. For optimal performance, use a fast local drive (avoid network storage such as NFS), and please refer to the **Dataset Caching and Streaming** section in `README.md` for further information. 
+
 ### Checkpoints Saving
 
 We use `--save_tensors` in these scripts, which saves `.pt` files instead of `.ply` files for checkpoints because `.pt` is faster and consumes less CPU memory. This is a necessary flag. 
