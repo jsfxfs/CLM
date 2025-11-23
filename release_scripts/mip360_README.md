@@ -25,7 +25,7 @@ CUDA_VISIBLE_DEVICES=1 bash release_scripts/mip360.sh /path/to/360_v2 naive_offl
 
 The `release_scripts/mip360.sh` script sequentially trains all seven mip360 scenes one after another: counter, bicycle, stump, garden, room, bonsai, and kitchen. 
 
-The training results will be saved into `path/to/clm-gs/output/mip360`. 
+The training results will be saved into `path/to/clm-gs/output/mip360`. Specifically, each run will be at `path/to/clm-gs/output/mip360/<timestamp>_<scene>_<strategy>/`.
 
 Once all experiments have finished, you can the training statistics for all experiments by running:
 
