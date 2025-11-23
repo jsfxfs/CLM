@@ -25,11 +25,8 @@ _<h4>✨ Accepted to appear in ASPLOS 2026 ✨</h4>_
 
 <div align="left">
 
-<!-- <div align="center">
-    <img src="assets/teaser.png" width="900">
-</div> -->
 <div align="center">
-    <img src="https://via.placeholder.com/900x400/cccccc/666666?text=Teaser+Image+Coming+Soon" width="900" alt="Teaser image placeholder">
+    <img src="assets/teaser_11210004_2x.gif" width="1000">
 </div>
 
 # Overview
@@ -55,12 +52,11 @@ We also provide multiple engineering-level memory-efficient optimizations:
 **Table of contents**
 -----
 - [Why use CLM-GS?](#why-use-clm-gs)
-- [How to use CLM?](#how-to-use-clm)
+- [How to use CLM?](#how-to-use-clm-gs)
     - [Setup](#setup)
     - [Training](#training)
-    - [Consideration about the flags](#consideration-about-the-flags)
-    - [Render Pretrained-Model](#rendering)
-- [Benefits and Examples](#benefits-and-examples)
+    - [Consideration about the flags](#considerations-about-the-flags)
+- [Example Usages](#example-usages)
 - [Paper](#paper-and-citation)
 - [License](#license)
 - [Reference](#reference)
