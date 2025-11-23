@@ -39,14 +39,14 @@ CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh <dataset_folder> <offloa
 
 ```bash
 # 10M Gaussians experiments (less aggressive densification)
-CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh /path/to/rubble-pixsfm no_offload 10m
-CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh /path/to/rubble-pixsfm clm_offload 10m
-CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh /path/to/rubble-pixsfm naive_offload 10m
+CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh /path/to/rubble-colmap no_offload 10m
+CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh /path/to/rubble-colmap clm_offload 10m
+CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh /path/to/rubble-colmap naive_offload 10m
 
 # 28M Gaussians experiments (more aggressive densification)
-CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh /path/to/rubble-pixsfm no_offload 28m
-CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh /path/to/rubble-pixsfm clm_offload 28m
-CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh /path/to/rubble-pixsfm naive_offload 28m
+CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh /path/to/rubble-colmap no_offload 28m
+CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh /path/to/rubble-colmap clm_offload 28m
+CUDA_VISIBLE_DEVICES=0 bash release_scripts/rubble4k.sh /path/to/rubble-colmap naive_offload 28m
 ```
 
 **Note:** The `clm_offload` strategy is recommended for memory efficiency, especially for the 28M scale.
