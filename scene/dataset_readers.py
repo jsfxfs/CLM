@@ -260,6 +260,7 @@ def readCamerasFromTransformsCity(
     extension=".png",
     undistorted=False,
     is_debug=False,
+    mode="train"
 ):
     args = utils.get_args()
     cam_infos = []
@@ -285,7 +286,7 @@ def readCamerasFromTransformsCity(
         new_frames = []
         for i in range(len(transforms_frames)):
             # assert transforms_frames[i]["file_path"] suffix is transforms_ocean_frames[i]["file_name"]
-            assert transforms_frames[i]["file_path"][-len(transforms_ocean_frames[i]["file_name"]):] == transforms_ocean_frames[i]["file_name"], f"Ocean info does not match the original frames at index {i}. Filename: {transforms_frames[i]['file_path']} vs {transforms_ocean_frames[i]['file_name']}"
+            assert transforms_frames[i]["file_name"][-len(transforms_ocean_frames[i]["file_name"]):] == transforms_ocean_frames[i]["file_name"], f"Ocean info does not match the original frames at index {i}. Filename: {transforms_frames[i]['file_path']} vs {transforms_ocean_frames[i]['file_name']}"
             if not transforms_ocean_frames[i]["is_ocean"]:
                 new_frames.append(transforms_frames[i])
         transforms["frames"] = new_frames
@@ -303,8 +304,8 @@ def readCamerasFromTransformsCity(
 
     frames = transforms["frames"]
     # check if filename already contain postfix
-    if frames[0]["file_path"].split(".")[-1] in ["jpg", "jpeg", "JPG", "png"]:
-        extension = ""
+    # if frames[0]["file_name"].split(".")[-1] in ["jpg", "jpeg", "JPG", "png"]:
+    #     extension = ""
 
     c2ws = np.array([frame["transform_matrix"] for frame in frames])
 
@@ -316,9 +317,10 @@ def readCamerasFromTransformsCity(
 
     for idx, frame in enumerate(frames):
         # cam_name = os.path.join(path, frame["file_path"] + extension)
-        cam_name = frame["file_path"]
-        if not os.path.exists(cam_name):
-            print(f"File {cam_name} not found, skipping...")
+        cam_name = frame["file_name"]
+        cam_path = os.path.join(path, "../..", mode, cam_name)
+        if not os.path.exists(cam_path):
+            print(f"File {cam_path} not found, skipping...")
             continue
         # NeRF 'transform_matrix' is a camera-to-world transform
         c2w = np.array(frame["transform_matrix"])
@@ -341,7 +343,7 @@ def readCamerasFromTransformsCity(
         )  # R is stored transposed due to 'glm' in CUDA code
         T = w2c[:3, 3]
 
-        image_path = os.path.join(path, cam_name)
+        image_path = cam_path
         image_name = cam_name[-17:]  # Path(cam_name).stem
         image = Image.open(image_path)
 
@@ -506,6 +508,7 @@ def readCityInfo(
         white_background,
         extension,
         undistorted,
+        mode="train"
     )
 
     if args.eval:
@@ -516,6 +519,7 @@ def readCityInfo(
             white_background,
             extension,
             undistorted,
+            mode="test"
         )
     else:
         test_cam_infos = []
