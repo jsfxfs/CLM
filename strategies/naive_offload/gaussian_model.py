@@ -205,7 +205,6 @@ class GaussianModelNaiveOffload(BaseGaussianModel):
                 return lr
 
     def save_tensors(self, parent_path):
-        from utils.system_utils import mkdir_p
 
         mkdir_p(parent_path)
 
