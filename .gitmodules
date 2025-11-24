@@ -11,3 +11,6 @@
 [submodule "submodules/clm_kernels"]
 	path = submodules/clm_kernels
 	url = git@github.com:TarzanZhao/clm_kernels.git
+[submodule "submodules/simple-knn"]
+	path = submodules/simple-knn
+	url = https://gitlab.inria.fr/bkerbl/simple-knn.git
