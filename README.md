@@ -21,7 +21,7 @@ CLM-GS
 _<h4>Removing the GPU Memory Barrier for 3D Gaussian Splatting with CPU Offloading</h4>_
 _<h4>✨ Accepted to appear in ASPLOS 2026 ✨</h4>_
 
-### [Paper](https://arxiv.org/abs/2406.18533) | [Project Page](https://daohanlu.github.io/scaling-up-3dgs/)
+### [Paper](https://arxiv.org/abs/2511.04951) | [Project Page](https://tarzanzhao.github.io/CLM-GS/)
 
 <div align="left">
 
@@ -140,8 +140,8 @@ python train.py -s <path to COLMAP dataset> --clm_offload --bsz 4
 
 ### **Three offloading strategies**
 
-To be simple, `no_offload` is just a GPU-only training baseline for the other two offloading strategies to compare. 
-And the `naive_offload` is an easy implementation but it is slow and cannot handle extreme large scene; CLM is fast and can support even larger Gaussians model. 
+To be simple, `--no_offload` is just a GPU-only training baseline for the other two offloading strategies to compare. 
+And the `--naive_offload` is an easy implementation but it is slow and cannot handle extreme large scene; `--clm_offload` is fast and can support even larger Gaussians model. 
 
 For detailed experimental setups and performance comparisons, see the "Why use CLM-GS?" section above and the `Example Usages` section below.
 
@@ -155,7 +155,7 @@ Use `--dataset_cache_and_stream_mode` to control how images are handled:
 
 This mode decodes JPG/PNG images into raw byte data when you first train on a dataset at a specific resolution, allowing on-demand streaming during training.
 
-- **Storage Location**: Ensure decoded images are saved on a local disk rather than a network file system (NFS). Loading from NFS is significantly slower. The default decoded path is `args.source_path/decode_{args.images}`. If `args.source_path` is on an NFS, specify `--decode_dataset_path` to point to a local disk location.
+- **Storage Location**: Ensure decoded images are saved on a local disk rather than a network file system (NFS). Loading from NFS is significantly slower. The default decoded path is `--source_path/decode_{args.images}`. If `--source_path` is on an NFS, specify `--decode_dataset_path` to point to a local disk location.
 - **Disk Space**: The decoded dataset can be very large. Calculate the required space as: `(# of images × height × width × 3) / 1024³ GB`
 - **First-Time Setup**: Initial decoding takes time, but the decoded dataset can be reused for subsequent training runs on the same scene.
 
@@ -197,11 +197,10 @@ This codebase uses microbatch pipelining with gradient accumulation. For each mi
 
 This design choice is important. Without microbatch pipelining, activation memory would grow linearly with batch size. With pipelining, activation memory remains constant at the level needed for rendering a single image.
 
-Learning rate and momentum are scaled according to Grendel-GS rules when increasing `--bsz`. Currently, `clm_offload` supports batch sizes of 4, 8, 16, 32, and 64. 
-
+Learning rate and momentum are scaled according to Grendel-GS rules when increasing `--bsz`. Currently, `--clm_offload` supports batch sizes of 4, 8, 16, 32, and 64. 
 
 <details>
-<summary><span style="font-weight: bold;">Command Line Arguments for train.py (CLM-specific)</span></summary>
+<summary><span style="font-weight: bold;">CLM-specific Command Line Arguments for train.py</span></summary>
 
   #### --no_offload
   Use GPU-only mode (no parameter offloading). Best for small scenes.
