@@ -39,7 +39,7 @@ By using CLM offloading, your 3DGS training can:
 - **Work with existing rendering kernels**: We use off-the-shelf rendering kernels from gsplat. Our offloading design is orthogonal to these rendering kernels, making it easy to integrate with your own splatting pipelines
 
 This codebase provides three modes of memory-efficient training strategies for your reference:
-- **no_offload**: 3DGS training only on GPU. We optimize memory usage with engineering tricks on a single GPU. This serves as a baseline for the two offloading modes below. (Implemented in `strategies/no_offload`)
+- **no_offload**: 3DGS training only on GPU. We optimize memory usage with engineering tricks on a single GPU. The show that CLM's offloading does not affect quality. (Implemented in `strategies/no_offload`)
 - **naive_offload**: A simple CPU offloading implementation that stores all Gaussian attributes (xyz, etc.) and their optimizer states on CPU, loads parameters onto GPU in each iteration, and offloads gradients back to CPU in each batch. This demonstrates the simplest offloading strategy, though it is slower. (Implemented in `strategies/naive_offload`)
 - **clm_offload**: Our most sophisticated offloading design that keeps selection-critical attributes on GPU while offloading others to CPU along with their optimizer states. It reduces memory usage to the extreme while maintaining good speed. The code is more complex but highly efficient. (Implemented in  `strategies/clm_offload`) 
 
@@ -116,6 +116,17 @@ pip install --no-build-isolation submodules/simple-knn
 
 ## Training
 
+### Dataset Preparation
+
+This repository trains a 3D Gaussian Splatting model using COLMAP-formatted input datasets. A COLMAP-formatted dataset contains a list of images with their corresponding camera poses, as well as an initial sparse point cloud that roughly represents the scene structure. This repository can reconstruct a detailed 3DGS model that captures intricate details from these images.
+
+The following two COLMAP-formatted example datasets are available for use in the following guide:
+- **Mip360 Dataset**: Download from https://jonbarron.info/mipnerf360/
+- **Rubble 4K Dataset**: Download from https://huggingface.co/datasets/HexuZhao/mega_nerf_rubble_colmap/tree/main
+
+<!-- 
+See [Tutorial 1](release_scripts/mip360_README.md) and [Tutorial 2](release_scripts/rubble4k_README.md) for detailed instructions on training with these datasets to achieve optimal performance.  -->
+
 ### Basic Training with Different Strategies
 
 **No Offload (GPU-Only, for small scenes)**:
@@ -156,7 +167,10 @@ Use `--dataset_cache_and_stream_mode` to control how images are handled:
 This mode decodes JPG/PNG images into raw byte data when you first train on a dataset at a specific resolution, allowing on-demand streaming during training.
 
 - **Storage Location**: Ensure decoded images are saved on a local disk rather than a network file system (NFS). Loading from NFS is significantly slower. The default decoded path is `--source_path/decode_{args.images}`. If `--source_path` is on an NFS, specify `--decode_dataset_path` to point to a local disk location.
-- **Disk Space**: The decoded dataset can be very large. Calculate the required space as: `(# of images × height × width × 3) / 1024³ GB`
+- **Disk Space**: The decoded dataset can be very large. Calculate the required space as:
+  ```
+  Disk Space (GB) = (num_images × image_height × image_width × 3) / 1024³
+  ```
 - **First-Time Setup**: Initial decoding takes time, but the decoded dataset can be reused for subsequent training runs on the same scene.
 
 If the decoded images path is corrupted or missing, simply remove the folder and rerun the decoding process.
@@ -259,7 +273,7 @@ The MatrixCity BigCity dataset represents the extreme upper bound of scene recon
 
 ---
 
-# Implementation Details
+<!-- # Implementation Details
 
 This section covers engineering-level optimizations implemented in CLM-GS for efficient memory management:
 
@@ -273,7 +287,7 @@ CLM-GS includes several low-level optimizations to maximize memory efficiency:
 
 - **PyTorch memory allocation**: Setting `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` reduces memory fragmentation in PyTorch's CUDA memory allocator. This environment variable is included in all training commands in the examples above.
 
-These optimizations work in conjunction with the three offloading strategies to achieve maximum memory efficiency across different hardware configurations.
+These optimizations work in conjunction with the three offloading strategies to achieve maximum memory efficiency across different hardware configurations. -->
 
 ---
 
