@@ -118,7 +118,7 @@ pip install --no-build-isolation submodules/simple-knn
 
 ### Dataset Preparation
 
-This repository trains a 3D Gaussian Splatting model using COLMAP-formatted input datasets. A COLMAP-formatted dataset contains a list of images with their corresponding camera poses, as well as an initial sparse point cloud that roughly represents the scene structure. This repository can reconstruct a detailed 3DGS model that captures intricate details from these images.
+This repository trains a 3D Gaussian Splatting model using COLMAP-formatted input datasets. A COLMAP-formatted dataset contains a list of images with their corresponding camera poses, as well as an initial sparse point cloud that roughly represents the scene structure. This repository can reconstruct a detailed 3DGS model that captures intricate details from these images within the colmap-formatted dataset.
 
 The following two COLMAP-formatted example datasets are available for use in the following guide:
 - **Mip360 Dataset**: Download from https://jonbarron.info/mipnerf360/
@@ -169,7 +169,7 @@ This mode decodes JPG/PNG images into raw byte data when you first train on a da
 - **Storage Location**: Ensure decoded images are saved on a local disk rather than a network file system (NFS). Loading from NFS is significantly slower. The default decoded path is `--source_path/decode_{args.images}`. If `--source_path` is on an NFS, specify `--decode_dataset_path` to point to a local disk location.
 - **Disk Space**: The decoded dataset can be very large. Calculate the required space as:
   ```
-  Disk Space (GB) = (num_images × image_height × image_width × 3) / 1024³
+  Disk Space = (num_images × image_height × image_width × 3) bytes
   ```
 - **First-Time Setup**: Initial decoding takes time, but the decoded dataset can be reused for subsequent training runs on the same scene.
 
@@ -241,7 +241,8 @@ Learning rate and momentum are scaled according to Grendel-GS rules when increas
 
 # Example Usages
 
-This section demonstrates CLM-GS on three different scales of scenes, from small benchmarks to extreme-scale reconstructions. Each example includes detailed reproduction instructions and usage pipelines.
+This section demonstrates CLM-GS on three different scales of scenes, from small benchmarks to extreme-scale reconstructions. Each example includes detailed reproduction instructions and usage pipelines. 
+In all examples, we set `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce memory fragmentation in PyTorch's CUDA memory allocator. 
 
 ## Our Testbed
 
