@@ -295,13 +295,11 @@ All three strategies share the following optimizations:
 
 The `strategies/` folder contains the core implementations. We implement a base Gaussian model in `strategies/base_gaussian_model.py` and common rendering functions in `strategies/base_engine.py`. The three strategy folders (`strategies/no_offload/`, `strategies/naive_offload/`, and `strategies/clm_offload/`) inherit these base files and incorporate their respective design details.
 
-Each strategy is explained in detail:
+Each strategy is explained in detail below:
 
-📖 **[Explain `--no_offload`](strategies/no_offload/README.md)**
-
-📖 **[Explain `--naive_offload`](strategies/naive_offload/README.md)**
-
-📖 **[Explain `--clm_offload`](strategies/clm_offload/README.md)**
+- 📖 **[`--no_offload` Strategy](strategies/no_offload/README.md)**
+- 📖 **[`--naive_offload` Strategy](strategies/naive_offload/README.md)**
+- 📖 **[`--clm_offload` Strategy](strategies/clm_offload/README.md)**
 
 
 <!-- # Implementation Details
