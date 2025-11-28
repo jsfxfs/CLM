@@ -22,14 +22,14 @@ The `clm_offload_train_one_batch()` function is the core implementation for trai
 
 4. **Render and backpropagate over all cameras**: We loop over each camera in the batch. Figure 6 in our paper illustrates how the pipeline works at the algorithm level. We have two GPU streams here: a communication stream and a computation stream. Rendering kernels and their backward kernels are launched to the computation stream.
 
-Kernels used to load parameters to GPU (`send_shs2gpu_stream()`, `send_shs2gpu_stream_retention()`) and offload gradients to CPU (`send_shs2cpu_grad_buffer_stream_retention()`, `send_shs2cpu_grad_buffer_stream()`) are launched to the communication stream. We implement custom CUDA kernels for these four communication functions. Because accessed Gaussian indices are always at random positions in memory, we use CUDA DMA in the CUDA kenerls to avoid extra data copies on either CPU or GPU. See `submodules/clm_kernel/` for our kernel implementations.
+    Kernels used to load parameters to GPU (`send_shs2gpu_stream()`, `send_shs2gpu_stream_retention()`) and offload gradients to CPU (`send_shs2cpu_grad_buffer_stream_retention()`, `send_shs2cpu_grad_buffer_stream()`) are launched to the communication stream. We implement custom CUDA kernels for these four communication functions. Because accessed Gaussian indices are always at random positions in memory, we use CUDA DMA in the CUDA kenerls to avoid extra data copies on either CPU or GPU. See `submodules/clm_kernel/` for our kernel implementations.
 
-We use CUDA events to synchronize between communication and computation streams. The `cpu2gpu_event` ensures that parameter loading on the communication stream finishes before rendering on the computation stream, while `gpu2cpu_event` ensures that rendering backward completes before calling kernels that send gradients back to CPU.
+    We use CUDA events to synchronize between communication and computation streams. The `cpu2gpu_event` ensures that parameter loading on the communication stream finishes before rendering on the computation stream, while `gpu2cpu_event` ensures that rendering backward completes before calling kernels that send gradients back to CPU.
 
-There is another synchronization point between the communication stream and the CPU Adam thread. Specifically, after the kernel for sending gradients back to CPU finishes on the communication stream for the i-th camera, `clm_kernels.set_signal(...)` sets `signal_tensor_pinned[i]` to true. This operation uses DMA from GPU to CPU pinned memory, with `__threadfence_system()` added to ensure gradients are fully written back. The CPU Adam thread uses a busy-wait loop to wait for `signal_tensor_pinned[i]` to become true before performing Adam updates.
+    There is another synchronization point between the communication stream and the CPU Adam thread. Specifically, after the kernel for sending gradients back to CPU finishes on the communication stream for the i-th camera, `clm_kernels.set_signal(...)` sets `signal_tensor_pinned[i]` to true. This operation uses DMA from GPU to CPU pinned memory, with `__threadfence_system()` added to ensure gradients are fully written back. The CPU Adam thread uses a busy-wait loop to wait for `signal_tensor_pinned[i]` to become true before performing Adam updates.
 
-Additionally, we use `.scatter_add_()` and `.gather()` to accelerate sparse operations throughout the code.
+    Additionally, we use `.scatter_add_()` and `.gather()` to accelerate sparse operations throughout the code.
 
-The rendering operations themselves follow standard procedures without special modifications.
+    The rendering operations themselves follow standard procedures without special modifications.
 
 5. **GPU Adam update**: At the end of batch training, we update the parameters residing on GPU. 
