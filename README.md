@@ -1,7 +1,4 @@
 <p align="center">
-    <!-- license badge -->
-    <a href="https://github.com/nerfstudio-project/nerfstudio/blob/master/LICENSE">
-        <img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
     <!-- stars badge -->
     <a href="https://github.com/nyu-systems/CLM-GS/stargazers">
         <img alt="GitHub stars" src="https://img.shields.io/github/stars/nyu-systems/CLM-GS?style=social"/>
@@ -355,7 +352,9 @@ black .
 
 # License
 
-Distributed under the Apache License Version 2.0 License. See `LICENSE.txt` for more information.
+This software is distributed under the Gaussian-Splatting License owned by **Inria** and **the Max Planck Institut for Informatik (MPII)**. The license grants non-exclusive rights to use the software for research purposes to research users (both academic and industrial), free of charge, for non-commercial use only.
+
+See `LICENSE.txt` for the complete license terms and conditions.
 
 # Reference
 
