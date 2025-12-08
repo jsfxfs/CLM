@@ -1,12 +1,16 @@
 #
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# Copyright (C) 2023, Inria GRAPHDECO research group
+# Copyright (C) 2025, New York University
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use
-# under the terms of the LICENSE.md file.
+# This software is free for non-commercial, research and evaluation use 
+# under the terms of the LICENSE file.
 #
-# For inquiries contact  george.drettakis@inria.fr
+# Original 3D Gaussian Splatting code from:
+# https://github.com/graphdeco-inria/gaussian-splatting
+#
+# CLM-GS modifications by NYU Systems Group
+# https://github.com/nyu-systems/CLM-GS
 #
 
 import torch
