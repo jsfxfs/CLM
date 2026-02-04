@@ -470,7 +470,7 @@ def load_checkpoint(args):
     # Use the first checkpoint file (assuming single GPU checkpoint)
     file_name = args.start_checkpoint + checkpoint_files[0]
     (model_params, start_from_this_iteration) = torch.load(
-        file_name, map_location=torch.device("cpu")
+        file_name, map_location=torch.device("cpu"), weights_only=False
     )
 
     if args.drop_duplicate_gaussians_coeff != 1.0:

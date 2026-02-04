@@ -693,6 +693,8 @@ def training_report(
                     scene.getTestCameras()
                     if scene.getTestCameras() is not None
                     else scene.getTestCamerasInfo()
+                    if scene.getTestCamerasInfo() is not None
+                    else []
                 ),
             },
             {
@@ -704,6 +706,8 @@ def training_report(
                         scene.getTrainCameras()
                         if scene.getTrainCameras() is not None
                         else scene.getTrainCamerasInfo()
+                        if scene.getTrainCamerasInfo() is not None
+                        else []
                     )
                     // args.llffhold,
                     1,
@@ -713,12 +717,18 @@ def training_report(
 
         # init workload division strategy
         for config in validation_configs:
+            if config["cameras_info"] is None:
+                continue
+            
             # Dataset is offloaded to disk
             l1_test = torch.scalar_tensor(0.0, device="cuda")
             psnr_test = torch.scalar_tensor(0.0, device="cuda")
 
             # TODO: if not divisible by world size
             num_cameras = min(config["num_cameras"], args.max_num_images_to_evaluate)
+            if num_cameras == 0:
+                continue
+            
             eval_dataset = OffloadSceneDataset(config["cameras_info"])
             # Init dataloader: num_workers = 0
             dataloader = DataLoader(

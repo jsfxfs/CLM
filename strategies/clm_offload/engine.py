@@ -135,7 +135,7 @@ import time
 def order_calculation(filters, batched_cameras, n_gaussians, bsz, perm_generator, args):
 
     match bsz:
-        case 4 | 8:
+        case 2 | 4 | 8:
             dtype = torch.int8
         case 16:
             dtype = torch.int16
@@ -144,7 +144,7 @@ def order_calculation(filters, batched_cameras, n_gaussians, bsz, perm_generator
         case 64:
             dtype = torch.int64
         case _:
-            raise ValueError("Currently supported bsz: (4, 8, 16, 32, 64).")
+            raise ValueError("Currently supported bsz: (2, 4, 8, 16, 32, 64).")
 
     torch.cuda.nvtx.range_push("init bitmap and vecs")
     gs_bitmap = torch.zeros((n_gaussians), dtype=dtype, device="cuda")

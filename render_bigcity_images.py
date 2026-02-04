@@ -845,13 +845,13 @@ def main():
     dataset_args = lp.extract(args)
 
     if args.naive_offload:
-        gaussians = GaussianModelNaiveOffload(sh_degree=dataset_args.sh_degree)
+        gaussians = GaussianModelNaiveOffload(sh_degree=dataset_args.sh_degree, only_for_rendering=True)
         utils.print_rank_0("Using GaussianModelNaiveOffload")
     elif args.clm_offload:
-        gaussians = GaussianModelCLMOffload(sh_degree=dataset_args.sh_degree)
+        gaussians = GaussianModelCLMOffload(sh_degree=dataset_args.sh_degree, only_for_rendering=True)
         utils.print_rank_0("Using GaussianModelCLMOffload")
     elif args.no_offload:
-        gaussians = GaussianModelNoOffload(sh_degree=dataset_args.sh_degree)
+        gaussians = GaussianModelNoOffload(sh_degree=dataset_args.sh_degree, only_for_rendering=True)
         utils.print_rank_0("Using GaussianModelNoOffload (no offload, GPU-only)")
     else:
         raise ValueError(

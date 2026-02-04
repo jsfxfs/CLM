@@ -174,6 +174,11 @@ class UnifiedAdam(torch.optim.Optimizer):
     def get_all_states(self):
         return [self.gpu_adam.state, self.cpu_adam.state]
 
+    def load_all_states(self, states):
+        self.gpu_adam.state = states[0]
+        self.cpu_adam.state = states[1]
+        self.state = self.gpu_adam.state | self.cpu_adam.state
+
     def zero_grad(self, set_to_none=False):
         self.gpu_adam.zero_grad(set_to_none)
         self.cpu_adam.zero_grad(set_to_none)

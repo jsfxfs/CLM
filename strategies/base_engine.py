@@ -47,18 +47,15 @@ def calculate_filters(batched_cameras, xyz_gpu, opacity_gpu, scaling_gpu, rotati
         )  # TODO: this function is too heavy to compute the filters. we can have much cheaper calculation.  # (B, N), (B, N, 2), (B, N), (B, N, 3), (B, N)
 
         (
+            batch_ids,  # (nnz,)
             camera_ids,  # (nnz,)
             gaussian_ids,  # (nnz,)
-            _,
-            # radii_packed, # (nnz,)
-            _,
-            # means2d_packed, # (nnz, 2)
-            _,
-            # depths_packed, # (nnz,)
-            _,
-            # conics_packed, # (nnz, 3)
-            _,
-            # compensations
+            indptr,  # (B*C+1,)
+            radii,  # (nnz, 2)
+            means,  # (nnz, 2)
+            depths,  # (nnz,)
+            conics,  # (nnz, 3)
+            compensations  # (nnz,)
         ) = proj_results
 
         output, counts = torch.unique_consecutive(camera_ids, return_counts=True)

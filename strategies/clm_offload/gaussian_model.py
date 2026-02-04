@@ -31,11 +31,21 @@ class GaussianModelCLMOffload(BaseGaussianModel):
         self.spatial_lr_scale = spatial_lr_scale
 
         # Allocate pinned buffers for features
-        parameters_buffer_array = numba.cuda.pinned_array(
-            (self.args.prealloc_capacity, 48), dtype=np.float32
-        )
+        # For rendering, use a smaller buffer size to save memory
+        if self.only_for_rendering:
+            # Use actual number of points for rendering, but cap at reasonable size
+            render_buffer_size = min(N, 100000)  # Cap at 100k points for rendering
+            parameters_buffer_array = numba.cuda.pinned_array(
+                (render_buffer_size, 48), dtype=np.float32
+            )
+        else:
+            parameters_buffer_array = numba.cuda.pinned_array(
+                (self.args.prealloc_capacity, 48), dtype=np.float32
+            )
+        
         self.parameters_buffer = torch.from_numpy(parameters_buffer_array)
         assert self.parameters_buffer.is_pinned()
+        
         if not self.only_for_rendering:
             parameters_grad_buffer_array = numba.cuda.pinned_array(
                 (self.args.prealloc_capacity, 48), dtype=np.float32
@@ -261,11 +271,21 @@ class GaussianModelCLMOffload(BaseGaussianModel):
         print("Number of points before initialization : ", N)
 
         # Allocate pinned buffer
-        parameters_buffer_array = numba.cuda.pinned_array(
-            (self.args.prealloc_capacity, 48), dtype=np.float32
-        )
+        # For rendering, use a smaller buffer size to save memory
+        if self.only_for_rendering:
+            # Use actual number of points for rendering, but cap at reasonable size
+            render_buffer_size = min(N, 100000)  # Cap at 100k points for rendering
+            parameters_buffer_array = numba.cuda.pinned_array(
+                (render_buffer_size, 48), dtype=np.float32
+            )
+        else:
+            parameters_buffer_array = numba.cuda.pinned_array(
+                (self.args.prealloc_capacity, 48), dtype=np.float32
+            )
+        
         self.parameters_buffer = torch.from_numpy(parameters_buffer_array)
         assert self.parameters_buffer.is_pinned()
+        
         if not self.only_for_rendering:
             parameters_grad_buffer_array = numba.cuda.pinned_array(
                 (self.args.prealloc_capacity, 48), dtype=np.float32
@@ -686,6 +706,34 @@ class GaussianModelCLMOffload(BaseGaussianModel):
                 # Update parameters.
                 N = group["params"][0].shape[0]
                 N_ext = extension_tensor.shape[0]
+                
+                # Check if buffer is large enough
+                if N + N_ext > self.parameters_buffer.shape[0]:
+                    # Need to resize the buffer
+                    new_size = max(int((N + N_ext) * 1.5), self.parameters_buffer.shape[0] * 2)
+                    print(f"Warning: Resizing parameters_buffer from {self.parameters_buffer.shape[0]} to {new_size}")
+                    
+                    # Create new buffer
+                    new_parameters_buffer_array = numba.cuda.pinned_array(
+                        (new_size, 48), dtype=np.float32
+                    )
+                    new_parameters_buffer = torch.from_numpy(new_parameters_buffer_array)
+                    
+                    # Create new grad buffer
+                    new_parameters_grad_buffer_array = numba.cuda.pinned_array(
+                        (new_size, 48), dtype=np.float32
+                    )
+                    new_parameters_grad_buffer = torch.from_numpy(new_parameters_grad_buffer_array)
+                    
+                    # Copy existing data
+                    new_parameters_buffer[:N] = self.parameters_buffer[:N]
+                    new_parameters_grad_buffer[:N] = self.parameters_grad_buffer[:N]
+                    
+                    self.parameters_buffer = new_parameters_buffer
+                    self.parameters_grad_buffer = new_parameters_grad_buffer
+                    assert self.parameters_buffer.is_pinned()
+                    assert self.parameters_grad_buffer.is_pinned()
+                
                 self.parameters_buffer[N : (N + N_ext)] = extension_tensor
                 group["params"][0] = nn.Parameter(
                     self.parameters_buffer[: (N + N_ext)].requires_grad_(True)
@@ -838,8 +886,10 @@ class GaussianModelCLMOffload(BaseGaussianModel):
         width,
         height,
     ):
+        # radii is (N, 2), take max to make it (N,)
+        radii_max = torch.max(radii, dim=-1)[0]
         self.max_radii2D[send2gpu_final_filter_indices] = torch.max(
-            self.max_radii2D[send2gpu_final_filter_indices], radii
+            self.max_radii2D[send2gpu_final_filter_indices], radii_max
         )
         grad = viewspace_point_tensor_grad  # (N, 2)
         # Normalize the gradients to [-1, 1] screen size
@@ -849,3 +899,86 @@ class GaussianModelCLMOffload(BaseGaussianModel):
             grad, dim=-1, keepdim=True
         )
         self.denom[send2gpu_final_filter_indices] += 1
+
+    def capture(self):
+        return (
+            self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            self.xyz_gradient_accum,
+            self.denom,
+            self.optimizer.get_all_states(),
+            self.spatial_lr_scale,
+        )
+
+    def restore(self, model_args, training_args):
+        (
+            self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_states,
+            self.spatial_lr_scale,
+        ) = model_args
+        
+        if self._features_rest.dim == 3:
+            self._features_rest = self._features_rest.view(
+                self._features_rest.shape[0], -1
+            )
+        
+        self._xyz = nn.Parameter(self._xyz.to("cuda").requires_grad_(True))
+        self._scaling = nn.Parameter(self._scaling.to("cuda").requires_grad_(True))
+        self._rotation = nn.Parameter(self._rotation.to("cuda").requires_grad_(True))
+        self._opacity = nn.Parameter(self._opacity.to("cuda").requires_grad_(True))
+        self.max_radii2D = self.max_radii2D.to("cuda")
+        
+        dims = [self._features_dc.shape[1], self._features_rest.shape[1]]
+        
+        # Check if buffer needs resizing
+        num_points = self._xyz.shape[0]
+        if num_points > self.parameters_buffer.shape[0]:
+            # Resize buffer to accommodate the restored data
+            new_size = max(int(num_points * 1.5), self.parameters_buffer.shape[0] * 2)
+            print(f"Warning: Resizing parameters_buffer from {self.parameters_buffer.shape[0]} to {new_size} for restore")
+            
+            # Create new buffer
+            new_parameters_buffer_array = numba.cuda.pinned_array(
+                (new_size, 48), dtype=np.float32
+            )
+            new_parameters_buffer = torch.from_numpy(new_parameters_buffer_array)
+            
+            # Create new grad buffer
+            new_parameters_grad_buffer_array = numba.cuda.pinned_array(
+                (new_size, 48), dtype=np.float32
+            )
+            new_parameters_grad_buffer = torch.from_numpy(new_parameters_grad_buffer_array)
+            
+            self.parameters_buffer = new_parameters_buffer
+            self.parameters_grad_buffer = new_parameters_grad_buffer
+            assert self.parameters_buffer.is_pinned()
+            assert self.parameters_grad_buffer.is_pinned()
+        
+        torch.cat((self._features_dc, self._features_rest), dim=1, out=self.parameters_buffer[:num_points])
+        self._parameters = nn.Parameter(self.parameters_buffer[:self._xyz.shape[0]].requires_grad_(True))
+        self._features_dc, self._features_rest = torch.split(
+            self._parameters, dims, dim=1
+        )
+        self.param_dims = torch.tensor(dims, dtype=torch.int, device="cuda")
+        
+        self.training_setup(training_args)
+        self.xyz_gradient_accum = xyz_gradient_accum.to("cuda")
+        self.denom = denom.to("cuda")
+        
+        if opt_states is not None:
+            self.optimizer.load_all_states(opt_states)
